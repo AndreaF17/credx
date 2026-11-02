@@ -136,6 +136,26 @@ class HandleConfigTests(_XdgTempMixin, unittest.TestCase):
         code, _ = self._run(config_action='use', name='nope')
         self.assertEqual(code, 1)
 
+    def test_rename_success(self):
+        keystore.set_key('default', 'K1')
+        code, _ = self._run(config_action='rename', old='default', new='primary')
+        self.assertEqual(code, 0)
+        self.assertEqual(keystore.get_key('primary'), 'K1')
+
+    def test_rename_missing_errors(self):
+        code, _ = self._run(config_action='rename', old='nope', new='x')
+        self.assertEqual(code, 1)
+
+    def test_rename_to_existing_errors(self):
+        keystore.set_key('a', 'K1')
+        keystore.set_key('b', 'K2')
+        code, _ = self._run(config_action='rename', old='a', new='b')
+        self.assertEqual(code, 1)
+
+    def test_rename_parsed(self):
+        args = main.parse_args(['config', 'rename', 'old', 'new'])
+        self.assertEqual((args.config_action, args.old, args.new), ('rename', 'old', 'new'))
+
     def test_show_masks_key(self):
         keystore.set_key('default', 'abcd1234efgh5678')
         code, out = self._run(config_action='show', name=None)

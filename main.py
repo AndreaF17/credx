@@ -62,6 +62,9 @@ except ImportError:  # pragma: no cover
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
+# Sentinel distinguishing "argument not supplied" from an explicit None.
+_UNSET: Any = object()
+
 # Buckets searched on IntelX, in priority order.
 BUCKETS: Tuple[str, ...] = ('leaks.private', 'leaks.public', 'leaks.private.li', 'pastes')
 
@@ -70,9 +73,12 @@ MAX_RETRIES: int = 3
 # Seconds before the first retry; doubles after each attempt (exponential backoff).
 RETRY_DELAY: float = 2.0
 # Default seconds between FILE_VIEW calls (rate limiting). Overridable with --delay.
-REQUEST_DELAY: float = 0.5
-# Default number of concurrent FILE_VIEW workers. 1 preserves legacy sequential behavior.
-DEFAULT_WORKERS: int = 1
+# Our RateLimiter is the single pacing authority (the SDK's own per-call sleep is
+# disabled, see load/main), so this spacing plus DEFAULT_WORKERS sets the throughput.
+REQUEST_DELAY: float = 0.2
+# Default concurrent FILE_VIEW workers. Concurrency overlaps per-call network latency,
+# which is the dominant cost when processing many leaks; retries/backoff absorb 429s.
+DEFAULT_WORKERS: int = 5
 # Default search range in months. Breached credentials are usually years old, so
 # the default reaches back two years; narrow it with --range when you want recency.
 DEFAULT_RANGE_MONTHS: int = 24
@@ -158,6 +164,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              'more business-data documents, which the extractor then filters out.',
     )
     parser.add_argument(
+        '--include-subdomains', action='store_true',
+        help='For a domain target, also match sub-domains (ds.example.com). By default '
+             'only the exact domain (example.com) is matched.',
+    )
+    parser.add_argument(
         '--expand-archives', action='store_true',
         help='Walk multi-file leaks (archives/folders) via the treeview and fetch '
              'each child file, so credentials inside bundles are not missed. '
@@ -222,7 +233,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         '--workers',
         type=int,
         default=DEFAULT_WORKERS,
-        help='Number of concurrent FILE_VIEW workers (default: 1, sequential)',
+        help=f'Concurrent FILE_VIEW workers (default: {DEFAULT_WORKERS}). Raise for speed, '
+             'lower to 1 for strict rate limits.',
     )
     parser.add_argument(
         '--delay',
@@ -258,6 +270,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     use_p = config_sub.add_parser('use', help='Switch the active key')
     use_p.add_argument('name', help='Name of the key to activate')
+
+    rename_p = config_sub.add_parser('rename', help='Rename a saved key')
+    rename_p.add_argument('old', help='Current key name')
+    rename_p.add_argument('new', help='New key name')
 
     show_p = config_sub.add_parser('show', help='Show a saved key (masked)')
     show_p.add_argument('--name', default=None, help='Key name (default: the active key)')
@@ -390,6 +406,22 @@ def resolve_api_key(args: argparse.Namespace, log: logging.Logger) -> Optional[s
     return None
 
 
+def _credit_rows(caps: Any) -> List[Tuple[str, Any, Any]]:
+    """Return ``[(endpoint, remaining, limit)]`` for endpoints that report credits."""
+    rows: List[Tuple[str, Any, Any]] = []
+    paths = caps.get('paths') if isinstance(caps, dict) else None
+    if isinstance(paths, dict):
+        for endpoint, info in sorted(paths.items()):
+            if not isinstance(info, dict):
+                continue
+            credit = info.get('Credit', info.get('credit'))
+            credit_max = info.get('CreditMax', info.get('creditMax', info.get('creditmax')))
+            if credit is None and credit_max is None:
+                continue
+            rows.append((str(endpoint).strip('/'), credit, credit_max))
+    return rows
+
+
 def format_key_usage(caps: Any) -> str:
     """Render an IntelX GET_CAPABILITIES (/authenticate/info) payload as a readable
     key-usage summary: per-endpoint remaining/limit credits."""
@@ -400,18 +432,7 @@ def format_key_usage(caps: Any) -> str:
     if account:
         lines.append(f"Account: {account}")
 
-    rows: List[Tuple[str, Any, Any]] = []
-    paths = caps.get('paths')
-    if isinstance(paths, dict):
-        for endpoint, info in sorted(paths.items()):
-            if not isinstance(info, dict):
-                continue
-            credit = info.get('Credit', info.get('credit'))
-            credit_max = info.get('CreditMax', info.get('creditMax', info.get('creditmax')))
-            if credit is None and credit_max is None:
-                continue
-            rows.append((str(endpoint).strip('/'), credit, credit_max))
-
+    rows = _credit_rows(caps)
     if rows:
         lines.append("Credits remaining/limit per endpoint:")
         for label, credit, credit_max in rows:
@@ -469,6 +490,20 @@ def handle_config(args: argparse.Namespace, log: logging.Logger) -> int:
             print(f"Active key is now '{args.name}'")
             return 0
         log.error(f"No saved key named '{args.name}' (see: credx config list)")
+        return 1
+
+    if action == 'rename':
+        if not args.new.strip():
+            log.error("New key name cannot be empty")
+            return 2
+        status = keystore.rename_key(args.old, args.new)
+        if status == 'ok':
+            print(f"Renamed key '{args.old}' -> '{args.new}'")
+            return 0
+        if status == 'missing':
+            log.error(f"No saved key named '{args.old}' (see: credx config list)")
+        else:  # 'exists'
+            log.error(f"A key named '{args.new}' already exists; pick another name or clear it first")
         return 1
 
     if action == 'show':
@@ -708,57 +743,58 @@ def run_search(
     max_results: int,
     log: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """Search every (term, bucket) pair and return storageid-deduplicated records.
+    """Search each term across ALL buckets in one API call, returning
+    storageid-deduplicated records.
 
-    Raises :class:`AllSearchesFailed` if *every* search errored, so a systemic
-    failure (bad key, quota, outage) is not mistaken for an empty result.
+    IntelX accepts a bucket list per request, so this issues one search per term
+    (not one per term-and-bucket) — far fewer API calls and much faster. ``-m`` is
+    the total result cap per term. Raises :class:`AllSearchesFailed` if *every*
+    search errored, so a systemic failure (bad key, quota, outage) is not mistaken
+    for an empty result.
     """
     all_results: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
+    bucket_list = list(buckets)
     searches = 0
     failures = 0
     last_error: Optional[BaseException] = None
 
     for term in search_terms:
-        for bucket in buckets:
-            searches += 1
-            log.debug(f"Searching bucket '{bucket}' for '{term}'...")
+        searches += 1
+        log.debug(f"Searching {len(bucket_list)} bucket(s) for '{term}'...")
+        try:
             try:
-                try:
-                    response = ix.search(
-                        term,
-                        maxresults=max_results,
-                        buckets=[bucket],
-                        datefrom=date_from,
-                        dateto=date_to,
-                    )
-                except TypeError as e:
-                    # intelxapi can raise this when the API returns {'records': None}.
-                    if "'NoneType' object is not iterable" in str(e):
-                        log.debug(
-                            f"IntelX SDK returned null records for term '{term}' in bucket '{bucket}', "
-                            "treating as empty result"
-                        )
-                        response = {'records': []}
-                    else:
-                        raise
+                response = ix.search(
+                    term,
+                    maxresults=max_results,
+                    buckets=bucket_list,
+                    datefrom=date_from,
+                    dateto=date_to,
+                )
+            except TypeError as e:
+                # intelxapi can raise this when the API returns {'records': None}.
+                if "'NoneType' object is not iterable" in str(e):
+                    log.debug(f"IntelX SDK returned null records for term '{term}', treating as empty")
+                    response = {'records': []}
+                else:
+                    raise
 
-                records = response.get('records') if isinstance(response, dict) else []
-                if not isinstance(records, list):
-                    records = []  # API returned a non-list (e.g. null) for records
-                for r in records:
-                    if not isinstance(r, dict):
-                        continue  # skip malformed record entries
-                    sid = r.get('storageid')
-                    if sid and sid not in seen_ids:
-                        seen_ids.add(sid)
-                        all_results.append(r)
-                log.debug(f"  -> {len(records)} records from {bucket} for '{term}'")
-            except EXPECTED_LEAK_ERRORS as e:
-                failures += 1
-                last_error = e
-                log.warning(f"Bucket '{bucket}' failed for '{term}': {e}")
-                continue
+            records = response.get('records') if isinstance(response, dict) else []
+            if not isinstance(records, list):
+                records = []  # API returned a non-list (e.g. null) for records
+            for r in records:
+                if not isinstance(r, dict):
+                    continue  # skip malformed record entries
+                sid = r.get('storageid')
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    all_results.append(r)
+            log.debug(f"  -> {len(records)} records for '{term}'")
+        except EXPECTED_LEAK_ERRORS as e:
+            failures += 1
+            last_error = e
+            log.warning(f"Search failed for '{term}': {e}")
+            continue
 
     if searches and failures == searches:
         raise AllSearchesFailed(
@@ -802,17 +838,29 @@ def _extract_buckets_from_capabilities(caps: Any) -> List[str]:
     return ordered
 
 
-def resolve_buckets(ix: Any, log: logging.Logger) -> Tuple[str, ...]:
+def fetch_capabilities(ix: Any, log: logging.Logger) -> Optional[Dict[str, Any]]:
+    """Fetch GET_CAPABILITIES once (used for both bucket selection and usage), or
+    None on failure — a best-effort probe must never abort the run."""
+    try:
+        caps = ix.GET_CAPABILITIES()
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"GET_CAPABILITIES failed ({e})")
+        return None
+    return caps if isinstance(caps, dict) else None
+
+
+def resolve_buckets(ix: Any, log: logging.Logger, caps: Any = _UNSET) -> Tuple[str, ...]:
     """Return the buckets to search.
 
     Prefers the account's actually-licensed buckets (so freshly-added sources
     such as stealer logs are covered without editing the code); falls back to
     the curated ``BUCKETS`` default whenever capabilities can't be determined.
+    ``caps`` may be a pre-fetched GET_CAPABILITIES payload to avoid a second call.
     """
-    try:
-        caps = ix.GET_CAPABILITIES()
-    except Exception as e:  # noqa: BLE001 - a best-effort probe must never abort the run
-        log.debug(f"GET_CAPABILITIES failed ({e}); using default bucket list")
+    if caps is _UNSET:
+        caps = fetch_capabilities(ix, log)
+    if not caps:
+        log.debug("No capabilities available; using default bucket list")
         return BUCKETS
 
     buckets = _extract_buckets_from_capabilities(caps)
@@ -939,63 +987,64 @@ def run_phonebook_search(
     log: logging.Logger,
     poll_delay: float = 0.0,
 ) -> List[str]:
-    """Enumerate selector values for ``term`` across ``buckets``, deduplicated."""
+    """Enumerate selector values for ``term`` across ALL buckets in one search,
+    deduplicated. One PHONEBOOK_SEARCH per term (not one per bucket) — fewer API calls."""
     selectors: List[str] = []
     seen: Set[str] = set()
+    bucket_list = list(buckets)
 
-    for bucket in buckets:
+    try:
+        search_id = ix.PHONEBOOK_SEARCH(
+            term, maxresults=max_results, buckets=bucket_list, datefrom=date_from, dateto=date_to,
+        )
+    except EXPECTED_LEAK_ERRORS as e:
+        log.warning(f"Phonebook search failed for '{term}': {e}")
+        return selectors
+
+    # The SDK returns a long search-id string on success, or a short error code.
+    if not isinstance(search_id, str) or len(search_id) <= 3:
+        log.debug(f"Phonebook search not started for '{term}' (response: {search_id!r})")
+        return selectors
+
+    remaining = max_results
+    empty_streak = 0
+    for _ in range(_PHONEBOOK_MAX_PAGES):
         try:
-            search_id = ix.PHONEBOOK_SEARCH(
-                term, maxresults=max_results, buckets=[bucket], datefrom=date_from, dateto=date_to,
-            )
+            page = ix.PHONEBOOK_SEARCH_RESULT(search_id, limit=max(remaining, 1))
         except EXPECTED_LEAK_ERRORS as e:
-            log.warning(f"Phonebook search failed for '{term}' in '{bucket}': {e}")
-            continue
+            log.debug(f"Phonebook result fetch failed for '{term}': {e}")
+            break
+        if not isinstance(page, dict):
+            break
 
-        # The SDK returns a long search-id string on success, or a short error code.
-        if not isinstance(search_id, str) or len(search_id) <= 3:
-            log.debug(f"Phonebook search not started for '{bucket}' (response: {search_id!r})")
-            continue
+        page_selectors = page.get('selectors') or []
+        for selector in page_selectors:
+            value = _selector_value(selector)
+            key = value.lower()
+            if value and key not in seen:
+                seen.add(key)
+                selectors.append(value)
 
-        remaining = max_results
-        empty_streak = 0
-        for _ in range(_PHONEBOOK_MAX_PAGES):
-            try:
-                page = ix.PHONEBOOK_SEARCH_RESULT(search_id, limit=max(remaining, 1))
-            except EXPECTED_LEAK_ERRORS as e:
-                log.debug(f"Phonebook result fetch failed for '{bucket}': {e}")
+        remaining -= len(page_selectors)
+        status = page.get('status')
+        # 1 = no more results, 2 = search id not found; 0/3 = keep polling.
+        if status in (1, 2) or remaining <= 0:
+            break
+        # Guard against busy-polling empty, non-terminal pages forever.
+        if not page_selectors:
+            empty_streak += 1
+            if empty_streak >= 3:
+                log.debug(f"Phonebook returned empty pages repeatedly for '{term}'; stopping")
                 break
-            if not isinstance(page, dict):
-                break
-
-            page_selectors = page.get('selectors') or []
-            for selector in page_selectors:
-                value = _selector_value(selector)
-                key = value.lower()
-                if value and key not in seen:
-                    seen.add(key)
-                    selectors.append(value)
-
-            remaining -= len(page_selectors)
-            status = page.get('status')
-            # 1 = no more results, 2 = search id not found; 0/3 = keep polling.
-            if status in (1, 2) or remaining <= 0:
-                break
-            # Guard against busy-polling empty, non-terminal pages forever.
-            if not page_selectors:
-                empty_streak += 1
-                if empty_streak >= 3:
-                    log.debug(f"Phonebook returned empty pages repeatedly for '{bucket}'; stopping")
-                    break
-            else:
-                empty_streak = 0
-            if poll_delay:
-                time.sleep(poll_delay)
         else:
-            log.warning(
-                f"Phonebook hit the {_PHONEBOOK_MAX_PAGES}-page cap for '{bucket}'; "
-                "results may be truncated (raise -m or narrow --range)."
-            )
+            empty_streak = 0
+        if poll_delay:
+            time.sleep(poll_delay)
+    else:
+        log.warning(
+            f"Phonebook hit the {_PHONEBOOK_MAX_PAGES}-page cap for '{term}'; "
+            "results may be truncated (raise -m or narrow --range)."
+        )
 
     log.info(f"Phonebook discovery found {len(selectors)} unique selector(s)")
     return selectors
@@ -1965,7 +2014,7 @@ def run_for_target(
     target_is_person_name = (not target_is_email) and (
         not looks_like_domain(target) or (bool(args.domain) and not has_dotted_tld(target))
     )
-    target_context = build_target_context(target)
+    target_context = build_target_context(target, include_subdomains=args.include_subdomains)
     person_context = (
         build_person_email_context(target, person_name=args.person_name) if target_is_email else None
     )
@@ -2163,10 +2212,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         ix = intelx_client(api_key)
-        buckets = resolve_buckets(ix, log)
+        # The SDK sleeps API_RATE_LIMIT seconds inside every call (1s by default),
+        # which serializes FILE_VIEW badly. credx does its own pacing (RateLimiter +
+        # --delay/--workers) and retry/backoff, so disable the SDK's blanket sleep.
+        if hasattr(ix, 'API_RATE_LIMIT'):
+            ix.API_RATE_LIMIT = 0
+        caps = fetch_capabilities(ix, log)  # one call, reused for buckets + usage
+        buckets = resolve_buckets(ix, log, caps=caps)
     except EXPECTED_LEAK_ERRORS as e:
         log.error(f"Error initializing IntelX API: {e}")
         return 1
+
+    key_label = (
+        'command-line (-k)' if args.apikey
+        else 'environment (INTELX_API_KEY)' if os.getenv('INTELX_API_KEY')
+        else f"saved '{args.key_name or keystore.load_config().get('active') or 'default'}'"
+    )
+    print_startup_banner(args, targets, key_label, buckets, date_from, date_to, caps)
 
     os.makedirs('out', exist_ok=True)
 
@@ -2279,6 +2341,84 @@ def print_run_summary(
         bar,
         '',
     ]
+    print('\n'.join(lines), file=sys.stderr)
+
+
+def _credx_version() -> str:
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            return version('credx')
+        except PackageNotFoundError:
+            return 'dev'
+    except Exception:  # noqa: BLE001
+        return 'dev'
+
+
+def print_startup_banner(
+    args: argparse.Namespace,
+    targets: List[str],
+    key_label: str,
+    buckets: Iterable[str],
+    date_from: str,
+    date_to: str,
+    caps: Any = None,
+) -> None:
+    """Print a config banner (and the key's API credit usage) to stderr at launch."""
+    bucket_list = list(buckets)
+    bar = colorize('═' * 60, 'dim')
+
+    def row(label: str, value: str) -> str:
+        return f"  {colorize(label.ljust(16), 'bold')}  {value}"
+
+    if len(targets) == 1:
+        target_cell = colorize(targets[0], 'cyan')
+    else:
+        target_cell = f"{colorize(len(targets), 'bold', 'cyan')} targets  ·  output: {args.output_mode}"
+
+    scoring = 'ML model' if args.model else 'heuristic'
+    matching = 'incl. subdomains' if args.include_subdomains else 'exact domain'
+    flags = [
+        name for name, enabled in (
+            ('company-wide', args.company_wide),
+            ('expand-archives', args.expand_archives),
+            ('phonebook', args.phonebook),
+            ('phonebook-search', args.phonebook_search),
+            ('usernames', args.usernames),
+            ('safe-share', args.safe_share),
+        ) if enabled
+    ]
+
+    lines = [
+        '',
+        bar,
+        colorize(f' credx {_credx_version()} ', 'bold', 'magenta')
+        + colorize(' · IntelX credential scanner', 'dim'),
+        bar,
+        row('Target', target_cell),
+        row('Range', f"last {args.range} months  ({date_from[:10]} → {date_to[:10]})"),
+        row('Buckets', f"{len(bucket_list)}"
+            + (f"  ({', '.join(bucket_list[:4])}{'…' if len(bucket_list) > 4 else ''})" if bucket_list else '')),
+        row('Extraction', f"{args.mode}  ·  scoring: {scoring}  ·  matching: {matching}"),
+        row('Output', f"{args.format}  →  out/"),
+        row('Concurrency', f"{args.workers} worker(s), {args.delay}s delay, max {args.maxresults}/term"),
+        row('API key', key_label),
+    ]
+    if flags:
+        lines.append(row('Flags', ', '.join(flags)))
+
+    rows = _credit_rows(caps)
+    if rows:
+        shown = '   '.join(f"{ep} {'?' if c is None else c}/{'?' if m is None else m}"
+                           for ep, c, m in rows[:5])
+        lines.append(row('API credits', shown))
+        exhausted = [ep for ep, c, _m in rows if isinstance(c, (int, float)) and c <= 0]
+        if exhausted:
+            lines.append('  ' + colorize(f"⚠ no credits left for: {', '.join(exhausted)}", 'yellow'))
+    elif caps is not None:
+        lines.append(row('API credits', colorize('unavailable', 'dim')))
+
+    lines += [bar, '']
     print('\n'.join(lines), file=sys.stderr)
 
 

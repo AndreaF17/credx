@@ -201,6 +201,50 @@ class BatchRunIntegrationTests(unittest.TestCase):
         self.assertTrue(os.path.exists('out/a.com-creds.json'))
 
 
+class StartupBannerTests(unittest.TestCase):
+    def _args(self, **over):
+        base = dict(
+            model=None, include_subdomains=False, company_wide=False, expand_archives=False,
+            phonebook=False, phonebook_search=False, usernames=False, safe_share=False,
+            output_mode='both', range=24, mode='balanced', format='txt',
+            workers=5, delay=0.2, maxresults=500,
+        )
+        base.update(over)
+        import argparse as _argparse
+        return _argparse.Namespace(**base)
+
+    def _banner(self, args, targets, key_label, buckets, caps):
+        import contextlib
+        import io as _io
+        err = _io.StringIO()
+        with contextlib.redirect_stderr(err):
+            main.print_startup_banner(
+                args, targets, key_label, buckets, '2024-01-01 00:00:00', '2024-12-31 23:59:59', caps,
+            )
+        return err.getvalue()
+
+    def test_banner_shows_config_and_credits(self):
+        caps = {'name': 'Acme', 'paths': {'/intelligent/search': {'Credit': 95, 'CreditMax': 100}}}
+        out = self._banner(self._args(), ['corp.com'], "saved 'default'", ['leaks.private', 'pastes'], caps)
+        self.assertIn('credx', out)
+        self.assertIn('corp.com', out)
+        self.assertIn('exact domain', out)
+        self.assertIn('95/100', out)
+
+    def test_banner_matching_reflects_include_subdomains(self):
+        out = self._banner(self._args(include_subdomains=True), ['corp.com'], 'env', ['pastes'], None)
+        self.assertIn('incl. subdomains', out)
+
+    def test_banner_warns_on_exhausted_credits(self):
+        caps = {'paths': {'/intelligent/search': {'Credit': 0, 'CreditMax': 100}}}
+        out = self._banner(self._args(), ['corp.com'], 'env', ['pastes'], caps)
+        self.assertIn('no credits left', out)
+
+    def test_banner_multi_target(self):
+        out = self._banner(self._args(), ['a.com', 'b.com', 'c.com'], 'env', ['pastes'], None)
+        self.assertIn('3 targets', out)
+
+
 if __name__ == '__main__':
     unittest.main()
 

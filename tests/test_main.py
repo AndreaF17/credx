@@ -90,7 +90,7 @@ class ParseArgsTests(unittest.TestCase):
 
     def test_defaults(self):
         args = main.parse_args(['-t', 'example.com'])
-        self.assertEqual(args.workers, 1)
+        self.assertEqual(args.workers, main.DEFAULT_WORKERS)
         self.assertEqual(args.delay, main.REQUEST_DELAY)
         self.assertEqual(args.format, 'txt')
 

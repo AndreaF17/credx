@@ -710,7 +710,9 @@ class HeaderCsvIntegrationTests(unittest.TestCase):
         self.assertEqual(new[0]['pattern'], 'sql_insert')
 
     def test_combolist_leak_still_parsed_when_csv_precheck_runs(self):
-        new = self._run('portal.corp.com:admin:StrongPass1')
+        # Exact domain (corp.com) so it matches the default exact-domain target;
+        # the point is that the per-line parser still runs under the CSV precheck.
+        new = self._run('corp.com:admin:StrongPass1')
         self.assertEqual(len(new), 1)
         self.assertEqual(new[0]['identity'], 'admin')
 

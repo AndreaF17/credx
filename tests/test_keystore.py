@@ -55,6 +55,24 @@ class KeystoreTests(unittest.TestCase):
     def test_remove_unknown_key_returns_false(self):
         self.assertFalse(keystore.remove_key('nope', path=self.path))
 
+    def test_rename_key_moves_and_updates_active(self):
+        keystore.set_key('default', 'K1', path=self.path)
+        keystore.set_key('client', 'K2', path=self.path)
+        keystore.use_key('client', path=self.path)
+        self.assertEqual(keystore.rename_key('client', 'acme', path=self.path), 'ok')
+        self.assertEqual(keystore.get_key('acme', path=self.path), 'K2')
+        self.assertIsNone(keystore.get_key('client', path=self.path))
+        self.assertEqual(keystore.load_config(self.path)['active'], 'acme')
+
+    def test_rename_missing_key(self):
+        self.assertEqual(keystore.rename_key('nope', 'x', path=self.path), 'missing')
+
+    def test_rename_to_existing_name_refused(self):
+        keystore.set_key('a', 'K1', path=self.path)
+        keystore.set_key('b', 'K2', path=self.path)
+        self.assertEqual(keystore.rename_key('a', 'b', path=self.path), 'exists')
+        self.assertEqual(keystore.get_key('a', path=self.path), 'K1')  # unchanged
+
     def test_clear_all(self):
         keystore.set_key('default', 'KEY1', path=self.path)
         keystore.clear_all(path=self.path)

@@ -111,6 +111,22 @@ def remove_key(name: str, path: Optional[str] = None) -> bool:
     return True
 
 
+def rename_key(old: str, new: str, path: Optional[str] = None) -> str:
+    """Rename a saved key. Returns 'ok', 'missing' (no such key), or 'exists'
+    (the new name is already taken)."""
+    path = path or config_path()
+    cfg = load_config(path)
+    if old not in cfg['keys']:
+        return 'missing'
+    if new != old and new in cfg['keys']:
+        return 'exists'
+    cfg['keys'][new] = cfg['keys'].pop(old)
+    if cfg.get('active') == old:
+        cfg['active'] = new
+    _atomic_write(path, cfg)
+    return 'ok'
+
+
 def clear_all(path: Optional[str] = None) -> None:
     """Remove every stored key."""
     _atomic_write(path or config_path(), {'active': None, 'keys': {}})

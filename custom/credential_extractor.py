@@ -420,21 +420,36 @@ def candidate_mentions_person_name(candidate, raw_line, person_context):
     return False
 
 
-def build_target_context(target):
+def build_target_context(target, include_subdomains=False):
+    """Build matching context for a domain/host target.
+
+    By default a candidate matches only the EXACT domain: ``example.com`` matches
+    ``user@example.com`` but not ``user@sub.example.com`` or ``example.com.evil.com``.
+    With ``include_subdomains`` a candidate on any sub-domain of the target matches too.
+    """
     target_plain = target.lstrip('@').strip().lower()
-    variants = {target_plain, normalize_obfuscations(target_plain).lower()}
+    hosts = {target_plain, normalize_obfuscations(target_plain).lower()}
 
     parsed = urlparse(target_plain if '://' in target_plain else f'http://{target_plain}')
     if parsed.hostname:
-        variants.add(parsed.hostname.lower())
-        variants.add(decode_punycode_host(parsed.hostname.lower()))
+        hosts.add(parsed.hostname.lower())
+        hosts.add(decode_punycode_host(parsed.hostname.lower()))
+    hosts = {h for h in hosts if h}
 
-    normalized_variants = {normalize_for_matching(item) for item in variants if item}
-    normalized_variants = {item for item in normalized_variants if item}
+    # Match a host as a WHOLE domain: bounded so neither a sub-domain
+    # (sub.example.com) nor a longer look-alike (example.com.evil.com, notexample.com)
+    # matches — unless include_subdomains allows leading sub-domain labels.
+    alts = '|'.join(re.escape(h) for h in sorted(hosts, key=len, reverse=True))
+    sub = r'(?:[a-z0-9_-]+\.)*' if include_subdomains else ''
+    pattern = (
+        re.compile(rf'(?<![a-z0-9._-])(?:{sub})(?:{alts})(?![a-z0-9._-])')
+        if alts else re.compile(r'(?!x)x')  # no host -> never match
+    )
     return {
         'target_plain': target_plain,
-        'variants': {item for item in variants if item},
-        'normalized_variants': normalized_variants,
+        'hosts': hosts,
+        'include_subdomains': include_subdomains,
+        'pattern': pattern,
     }
 
 
@@ -530,13 +545,12 @@ def _candidate_text_forms(candidate, raw_line):
 
 
 def candidate_mentions_target(candidate, raw_line, target_context):
-    for lowered, normalized in _candidate_text_forms(candidate, raw_line):
-        for variant in target_context['variants']:
-            if variant and variant in lowered:
-                return True
-        for normalized_variant in target_context['normalized_variants']:
-            if normalized_variant and normalized_variant in normalized:
-                return True
+    """True when the candidate is on the target domain (exact by default; sub-domains
+    too when the context was built with include_subdomains)."""
+    pattern = target_context['pattern']
+    for lowered, _normalized in _candidate_text_forms(candidate, raw_line):
+        if pattern.search(lowered):
+            return True
     return False
 
 

@@ -98,17 +98,26 @@ class RunSearchResilienceTests(unittest.TestCase):
             main.run_search(FailIX(), ['t'], ['b1', 'b2'], 'a', 'b', 10, self.log)
 
     def test_partial_failure_tolerated(self):
+        # One term fails, another succeeds (buckets are now searched in one call per
+        # term, so resilience is at the term level).
         class PartialIX:
-            def __init__(self):
-                self.n = 0
-
-            def search(self, *a, **k):
-                self.n += 1
-                if self.n == 1:
+            def search(self, term, maxresults, buckets, datefrom, dateto):
+                if term == 't1':
                     raise OSError('x')
                 return {'records': [{'storageid': 's1'}]}
-        results = main.run_search(PartialIX(), ['t'], ['b1', 'b2'], 'a', 'b', 10, self.log)
+        results = main.run_search(PartialIX(), ['t1', 't2'], ['b1', 'b2'], 'a', 'b', 10, self.log)
         self.assertEqual(len(results), 1)
+
+    def test_searches_all_buckets_in_one_call_per_term(self):
+        calls = []
+
+        class RecordIX:
+            def search(self, term, maxresults, buckets, datefrom, dateto):
+                calls.append((term, tuple(buckets)))
+                return {'records': []}
+        main.run_search(RecordIX(), ['t1', 't2'], ['b1', 'b2', 'b3'], 'a', 'b', 10, self.log)
+        # One call per term, each passing ALL buckets (not one call per bucket).
+        self.assertEqual(calls, [('t1', ('b1', 'b2', 'b3')), ('t2', ('b1', 'b2', 'b3'))])
 
     def test_non_list_records_and_non_dict_entries(self):
         class WeirdIX:

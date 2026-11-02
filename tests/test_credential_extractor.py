@@ -16,6 +16,38 @@ from custom.credential_extractor import (
 )
 
 
+class DomainExactnessTests(unittest.TestCase):
+    """A domain target matches only the exact domain by default; subdomains need
+    --include-subdomains (include_subdomains=True)."""
+
+    def _matches(self, target, line, include_subdomains=False):
+        ctx = build_target_context(target, include_subdomains=include_subdomains)
+        cands = extract_credentials_from_line(line, mode='balanced')
+        return any(candidate_mentions_target(c, line, ctx) for c in cands)
+
+    def test_exact_domain_matches(self):
+        self.assertTrue(self._matches('example.com', 'example.com:admin:StrongPass1'))
+        self.assertTrue(self._matches('example.com', 'user@example.com:StrongPass1'))
+        self.assertTrue(self._matches('example.com', 'http://example.com/login:admin:StrongPass1'))
+
+    def test_subdomain_excluded_by_default(self):
+        self.assertFalse(self._matches('example.com', 'user@ds.example.com:StrongPass1'))
+        self.assertFalse(self._matches('example.com', 'ds.example.com:admin:StrongPass1'))
+
+    def test_lookalike_longer_domain_excluded(self):
+        self.assertFalse(self._matches('example.com', 'user@example.com.evil.com:StrongPass1'))
+        self.assertFalse(self._matches('example.com', 'user@notexample.com:StrongPass1'))
+
+    def test_subdomain_included_with_flag(self):
+        self.assertTrue(self._matches('example.com', 'user@ds.example.com:StrongPass1', include_subdomains=True))
+        self.assertTrue(self._matches('example.com', 'user@deep.sub.example.com:StrongPass1', include_subdomains=True))
+        # Exact still matches in subdomain mode.
+        self.assertTrue(self._matches('example.com', 'user@example.com:StrongPass1', include_subdomains=True))
+
+    def test_subdomain_mode_still_excludes_lookalike(self):
+        self.assertFalse(self._matches('example.com', 'user@example.com.evil.com:StrongPass1', include_subdomains=True))
+
+
 class CredentialExtractorTests(unittest.TestCase):
     def test_parses_scheme_less_host_format(self):
         line = 'stage.ivsanbernard.it/:stage.ivsanbernard.it:Nonmelaricordo1'

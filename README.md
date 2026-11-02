@@ -102,6 +102,7 @@ echo "$KEY" | credx config set-key --stdin --name ci   # from a pipe, for script
 credx config use client-a                # switch the active key
 credx config list                        # list saved keys (masked), * marks the active one
 credx config show --name client-a        # show one key (masked)
+credx config rename client-a acme        # rename a saved key
 credx config usage                       # show the active key's IntelX credit usage
 credx config clear client-a              # remove one key  (or: --all to remove every key)
 ```
@@ -124,7 +125,7 @@ credx auto-detects what you're targeting from `-t` and switches modes:
 
 | Target | Example | What it searches |
 |---|---|---|
-| **Domain** | `-t corp.com` | The `@corp.com` email selector (add `--company-wide` for host-form creds) |
+| **Domain** | `-t corp.com` | The `@corp.com` email selector — **exact domain only** by default (add `--include-subdomains` for `*.corp.com`, `--company-wide` for host-form creds) |
 | **Email** | `-t john.doe@corp.com` | The exact address (add `--usernames` to also try `john.doe` / `john doe` / `johndoe`) |
 | **Person (name + domain)** | `-t "John Doe" --domain corp.com` | Name variants, anchored to the domain — **recommended** for people |
 | **Person (name only)** | `-t "John Doe"` | Name variants alone — works, but noisy; pair with `--domain` when you can |
@@ -208,6 +209,7 @@ credx -t example.com --workers 4 --delay 0.5
 | `--domain` | `corp.com` | | Anchor a person-name target to a company domain |
 | `--usernames` | | off | For an email target, also search username/local-part variants |
 | `--company-wide` | | off | For a domain target, also search the bare domain (catches `domain:user:pass`) |
+| `--include-subdomains` | | off | Match sub-domains of a domain target (`ds.example.com`); default is exact domain only |
 | `--expand-archives` | | off | Walk multi-file leaks (archives/folders) and fetch each child file |
 | `--phonebook` | | off | Enumerate leaked selectors to `out/<target>-emails.txt` |
 | `--phonebook-search` | | off | Hunt credentials for each discovered email on the target domain (implies `--phonebook`). Big recall boost, many extra API calls |
@@ -216,8 +218,8 @@ credx -t example.com --workers 4 --delay 0.5
 | `--safe-share` | | off | Also write a sanitized CSV safe to share externally |
 | `--safe-output` | `FILE` | `out/<output>-safe.csv` | Safe-share output path |
 | `--mode` | `strict\|balanced\|aggressive` | `balanced` | Extraction precision/recall |
-| `--workers` | `N` | `1` | Concurrent FILE_VIEW workers |
-| `--delay` | `SECONDS` | `0.5` | Delay between FILE_VIEW calls (rate limiting) |
+| `--workers` | `N` | `5` | Concurrent FILE_VIEW workers (raise for speed, lower for strict rate limits) |
+| `--delay` | `SECONDS` | `0.2` | Delay between FILE_VIEW calls (rate limiting) |
 | `--model` | `[PATH]` | heuristic | Score with the ML model instead of the heuristic |
 
 Run `credx --help` for the authoritative list.
@@ -325,6 +327,8 @@ credx -t example.com   # continues where it left off
 - **Structured-dump parsing** — reads SQL `INSERT` statements, JSON/NDJSON exports, and header-named CSV (where the credential columns are named), not just delimited combolists
 - **Multi-key management** — save, name, switch and inspect multiple IntelX keys (`credx config`), with per-key credit-usage reporting
 - **Batch targets** — scan a comma-list or a file of targets in one run, writing per-target files and/or a combined report (`--output-mode`)
+- **Exact-domain matching** — a domain target matches only that domain by default (not its sub-domains); opt into sub-domains with `--include-subdomains`
+- **Fast by default** — concurrent fetching plus one search call across all buckets; a startup banner shows the run config and the key's remaining API credits
 - **Password-hash detection** — tags each secret as plaintext or a hash type (MD5, SHA-1/256/512, bcrypt, argon2, md5crypt…), so you know what you're cracking
 - **False-positive filtering** with confidence scoring on every match
 - **Optional ML scorer** (stdlib logistic regression) for the cases the heuristic over-trusts
