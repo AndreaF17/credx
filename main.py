@@ -882,8 +882,7 @@ def resolve_buckets(ix: Any, log: logging.Logger, caps: Any = _UNSET) -> Tuple[s
 
     buckets = _extract_buckets_from_capabilities(caps)
     if buckets:
-        log.info(f"Using {len(buckets)} licensed buckets from account capabilities")
-        log.debug(f"Licensed buckets: {buckets}")
+        log.debug(f"Using {len(buckets)} licensed buckets from account capabilities: {buckets}")
         return tuple(buckets)
 
     log.debug("Could not determine licensed buckets from capabilities; using default list")
@@ -2244,10 +2243,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("No targets to search. Pass -t <target|list|file>.")
         return 2
     if args.target and os.path.isfile(args.target):
-        log.info(f"Reading {len(targets)} target(s) from file: {args.target}")
+        log.debug(f"Reading {len(targets)} target(s) from file: {args.target}")
 
     date_from, date_to = compute_date_range(args.range)
-    log.info(f"Searching from {date_from} to {date_to}")
 
     # Load the ML model (if any) BEFORE the rate-limited search(es), so a bad
     # --model path fails fast instead of after a long run.
@@ -2260,7 +2258,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "Train one with: credx-train"
             )
         else:
-            log.info(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
+            log.debug(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
 
     try:
         ix = intelx_client(api_key)
@@ -2286,7 +2284,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else 'environment (INTELX_API_KEY)' if os.getenv('INTELX_API_KEY')
         else f"saved '{args.key_name or keystore.load_config().get('active') or 'default'}'"
     )
-    print_startup_banner(args, targets, key_label, buckets, date_from, date_to, caps)
+    print_startup_banner(args, targets, key_label, buckets, date_from, date_to, caps, scorer=scorer)
 
     os.makedirs('out', exist_ok=True)
 
@@ -2421,6 +2419,7 @@ def print_startup_banner(
     date_from: str,
     date_to: str,
     caps: Any = None,
+    scorer: Any = None,
 ) -> None:
     """Print a config banner (and the key's API credit usage) to stderr at launch."""
     bucket_list = list(buckets)
@@ -2434,7 +2433,7 @@ def print_startup_banner(
     else:
         target_cell = f"{colorize(len(targets), 'bold', 'cyan')} targets  ·  output: {args.output_mode}"
 
-    scoring = 'ML model' if args.model else 'heuristic'
+    scoring = 'ML model' if scorer is not None else 'heuristic'
     matching = 'incl. subdomains' if args.include_subdomains else 'exact domain'
     flags = [
         name for name, enabled in (
@@ -2452,6 +2451,7 @@ def print_startup_banner(
         bar,
         colorize(f' credx {_credx_version()} ', 'bold', 'magenta')
         + colorize(' · IntelX credential scanner', 'dim'),
+        colorize(' developed by AndreaF17 · https://github.com/AndreaF17/credx', 'dim'),
         bar,
         row('Target', target_cell),
         row('Range', f"last {args.range} months  ({date_from[:10]} → {date_to[:10]})"),
