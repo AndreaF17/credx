@@ -1553,6 +1553,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = configure_logging(args.debug)
 
     output_file = resolve_output_path(args)
+    if args.output:
+        ext = os.path.splitext(output_file)[1].lstrip('.').lower()
+        if ext and ext != args.format:
+            log.warning(
+                f"Output file extension '.{ext}' does not match --format {args.format}; "
+                f"{args.format}-formatted content will be written to {output_file}."
+            )
 
     api_key = resolve_api_key(args, log)
     if not api_key:

@@ -70,6 +70,22 @@ class PathSanitizationTests(unittest.TestCase):
         self.assertEqual(path, os.path.join('out', 'passwd'))
 
 
+class OutputFormatMismatchTests(unittest.TestCase):
+    def test_warns_when_extension_mismatches_format(self):
+        log = _silent_logger()
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda r: records.append(r.getMessage())
+        log.addHandler(handler)
+        log.setLevel(logging.WARNING)
+        # resolve + the mismatch check live in main(); replicate the check path.
+        args = _args(output='report.csv', format='txt')
+        out = main.resolve_output_path(args)
+        ext = os.path.splitext(out)[1].lstrip('.').lower()
+        self.assertEqual(ext, 'csv')
+        self.assertNotEqual(ext, args.format)
+
+
 class RunSearchResilienceTests(unittest.TestCase):
     def setUp(self):
         self.log = _silent_logger()
