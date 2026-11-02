@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 import re
+import unicodedata
 from urllib.parse import urlparse
+
+# Inline credential regexes backtrack badly on very long lines with no trailing
+# ``:password`` (minified JSON, base64 blobs, CRM rows IntelX returns). We cap the
+# chunk length they scan so a pathological line can't stall a worker (ReDoS guard).
+_MAX_INLINE_SCAN = 2000
+# Absurdly long lines are blobs, not combolists; skip extraction entirely.
+_MAX_LINE_LEN = 50000
 
 DEFAULT_MODE = 'balanced'
 EXTRACTION_MODES = {
@@ -24,7 +32,7 @@ EXTRACTION_MODES = {
     },
 }
 
-EMAIL_INLINE_PATTERN = re.compile(r'([^/:\s;|,]+@[^/:\s;|,]+\.[a-zA-Z]{2,}):([^\s;|,]+)')
+EMAIL_INLINE_PATTERN = re.compile(r'([^/:\s;|,]+@[^/:\s;|,]+\.[a-zA-Z]{2,}):([^:\s;|,]+)')
 URL_INLINE_PATTERN = re.compile(r'((?:https?://)[^\s:;|,]+):([^:@/\s;|,]+):([^\s;|,]+)')
 HOST_INLINE_PATTERN = re.compile(r'((?=[^:\s;|,]*[./])[^:\s;|,]+):([^:@/\s;|,]+):([^\s;|,]+)')
 DELIMITER_PATTERN = re.compile(r'\s*[;|,\t]\s*')
@@ -107,13 +115,23 @@ def sanitize_value(value):
 
 
 def normalize_obfuscations(value):
-    lowered = value
-    lowered = re.sub(r'hxxps://', 'https://', lowered, flags=re.IGNORECASE)
-    lowered = re.sub(r'hxxp://', 'http://', lowered, flags=re.IGNORECASE)
-    lowered = lowered.replace('[.]', '.').replace('(.)', '.').replace('{.}', '.')
-    lowered = lowered.replace('\\.', '.')
-    lowered = re.sub(r'\s+dot\s+', '.', lowered, flags=re.IGNORECASE)
-    return lowered
+    result = value
+    result = re.sub(r'hxxps://', 'https://', result, flags=re.IGNORECASE)
+    result = re.sub(r'hxxp://', 'http://', result, flags=re.IGNORECASE)
+    result = result.replace('[.]', '.').replace('(.)', '.').replace('{.}', '.')
+    result = result.replace('\\.', '.')
+    result = re.sub(r'\s+dot\s+', '.', result, flags=re.IGNORECASE)
+    return result
+
+
+def fold_accents(value):
+    """Fold accented characters to ASCII (José -> Jose, Müller -> Muller).
+
+    Lets an accented person name match its ASCII email/username form. Already-ASCII
+    values are unchanged. (NFKD does not fold ß -> ss; that is out of scope.)
+    """
+    decomposed = unicodedata.normalize('NFKD', value)
+    return ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def decode_punycode_host(host):
@@ -154,7 +172,7 @@ def canonicalize_url_part(url_part):
 
 
 def normalize_for_matching(value):
-    value = normalize_obfuscations(value)
+    value = fold_accents(normalize_obfuscations(value))
     value = value.lower()
     return re.sub(r'[^a-z0-9]', '', value)
 
@@ -186,13 +204,17 @@ def _derive_person_name_variants(email, person_name=None, include_local_from_ema
             _add_unique(variants, seen, clean_name)
             _add_unique(variants, seen, f'"{clean_name}"')
 
+            # Fold accents before tokenizing so "José García" yields jose/garcia
+            # forms that match ASCII usernames/emails, not jos/garca.
             name_tokens = [
                 token
-                for token in NAME_TOKEN_SPLIT_PATTERN.split(clean_name.lower())
+                for token in NAME_TOKEN_SPLIT_PATTERN.split(fold_accents(clean_name).lower())
                 if token
             ]
             if len(name_tokens) >= 2:
                 _add_unique(variants, seen, ''.join(name_tokens))
+                # first.last is the dominant corporate username/email-local form.
+                _add_unique(variants, seen, f"{name_tokens[0]}.{name_tokens[-1]}")
 
     return variants
 
@@ -261,7 +283,8 @@ def build_search_terms(
         return terms
 
     # Domain target: email selector by default, bare domain only when asked.
-    domain_plain = target_normalized.lstrip('@')
+    # Lowercased for consistency with every other search-term builder.
+    domain_plain = target_normalized.lstrip('@').lower()
     _add_unique(terms, seen, f"@{domain_plain}")
     if company_wide:
         _add_unique(terms, seen, domain_plain)
@@ -317,20 +340,9 @@ def candidate_mentions_person_name(candidate, raw_line, person_context):
     With a domain, requires a name variant AND the domain in the same context.
     Without a domain, a name variant alone is enough.
     """
-    texts = [
-        raw_line,
-        candidate.get('identity', ''),
-        candidate.get('url', ''),
-        candidate.get('canonical', ''),
-    ]
     domain_norm = person_context.get('domain_normalized', '')
 
-    for text in texts:
-        if not text:
-            continue
-        lowered = normalize_obfuscations(text).lower()
-        normalized = normalize_for_matching(text)
-
+    for lowered, normalized in _candidate_text_forms(candidate, raw_line):
         name_hit = any(
             variant and variant in lowered
             for variant in person_context.get('name_variants', ())
@@ -438,20 +450,24 @@ def calculate_confidence(identity, password, url_part, pattern):
     return round(base, 3)
 
 
-def candidate_mentions_target(candidate, raw_line, target_context):
-    texts = [
+def _candidate_text_forms(candidate, raw_line):
+    """Yield ``(lowered, normalized)`` forms for every text tied to a candidate.
+
+    Shared by all candidate_mentions_* matchers so they scan the same fields in
+    the same order (raw line, identity, url, canonical).
+    """
+    for text in (
         raw_line,
-        candidate.get('url', ''),
         candidate.get('identity', ''),
+        candidate.get('url', ''),
         candidate.get('canonical', ''),
-    ]
+    ):
+        if text:
+            yield normalize_obfuscations(text).lower(), normalize_for_matching(text)
 
-    for text in texts:
-        if not text:
-            continue
-        lowered = normalize_obfuscations(text).lower()
-        normalized = normalize_for_matching(text)
 
+def candidate_mentions_target(candidate, raw_line, target_context):
+    for lowered, normalized in _candidate_text_forms(candidate, raw_line):
         for variant in target_context['variants']:
             if variant and variant in lowered:
                 return True
@@ -463,23 +479,11 @@ def candidate_mentions_target(candidate, raw_line, target_context):
 
 def candidate_mentions_person_email(candidate, raw_line, person_context):
     """Match candidate against a person email target without falling back to domain-only hits."""
-    texts = [
-        raw_line,
-        candidate.get('identity', ''),
-        candidate.get('url', ''),
-        candidate.get('canonical', ''),
-    ]
-
     local_norm = person_context.get('local_normalized', '')
     domain_norm = person_context.get('domain_normalized', '')
     email_norm = person_context.get('email_normalized', '')
 
-    for text in texts:
-        if not text:
-            continue
-        lowered = normalize_obfuscations(text).lower()
-        normalized = normalize_for_matching(text)
-
+    for lowered, normalized in _candidate_text_forms(candidate, raw_line):
         # Strong match on the exact email (supports obfuscated variants via normalization)
         if email_norm and email_norm in normalized:
             return True
@@ -617,6 +621,10 @@ def _extract_from_triplet_windows(chunk, candidates, seen, mode):
 
 
 def _extract_from_inline_patterns(chunk, candidates, seen):
+    # These patterns backtrack quadratically on a very long chunk that lacks the
+    # trailing ":password"; cap the length they scan. KV/triplet passes still run.
+    if len(chunk) > _MAX_INLINE_SCAN:
+        return
     for match in URL_INLINE_PATTERN.finditer(chunk):
         _build_candidate(candidates, seen, match.group(2), match.group(3), match.group(1), 'url_delimited', chunk)
 
@@ -648,7 +656,7 @@ def _split_chunks(line):
 
 def extract_credentials_from_line(line, mode=DEFAULT_MODE):
     raw_line = line.strip()
-    if not raw_line:
+    if not raw_line or len(raw_line) > _MAX_LINE_LEN:
         return []
 
     normalized_line = normalize_obfuscations(raw_line)
@@ -669,12 +677,3 @@ def extract_credentials_from_line(line, mode=DEFAULT_MODE):
         candidates = [candidate for candidate in candidates if candidate.get('url')]
 
     return sorted(candidates, key=lambda item: item['confidence'], reverse=True)
-
-
-def parse_credential(line, mode=DEFAULT_MODE):
-    candidates = extract_credentials_from_line(line, mode=mode)
-    if not candidates:
-        return None
-
-    best = candidates[0]
-    return best['identity'], best['password'], best['url']

@@ -88,7 +88,10 @@ class CredentialExtractorTests(unittest.TestCase):
         self.assertIn('john.doe@example.com', lowered_terms)
         self.assertIn('@example.com', lowered_terms)
         self.assertIn('john doe', lowered_terms)
-        self.assertNotIn('john.doe', lowered_terms)
+        # With an explicit person name, the dominant first.last corporate
+        # username/email-local form is a desired search term.
+        self.assertIn('john.doe', lowered_terms)
+        self.assertIn('johndoe', lowered_terms)
 
     def test_email_target_default_uses_exact_email_only(self):
         terms = build_search_terms('info@example.it', include_email_pattern=False, person_name=None)
@@ -250,6 +253,38 @@ class PersonNameTargetTests(unittest.TestCase):
         ctx = build_person_name_context('John Doe')
         cand = {'identity': 'john doe', 'url': '', 'canonical': 'x'}
         self.assertTrue(candidate_mentions_person_name(cand, 'john doe:secret', ctx))
+
+    def test_accented_name_matches_ascii_email(self):
+        ctx = build_person_name_context('José García', domain='corp.com')
+        cand = {'identity': 'jose.garcia@corp.com', 'url': '', 'canonical': 'jose.garcia@corp.com:pw'}
+        self.assertTrue(candidate_mentions_person_name(cand, 'jose.garcia@corp.com:pw', ctx))
+
+    def test_name_terms_include_first_last_form(self):
+        terms = {t.lower() for t in build_name_search_terms('John Doe')}
+        self.assertIn('john.doe', terms)
+        self.assertIn('johndoe', terms)
+
+
+class NormalizeAndRedosTests(unittest.TestCase):
+    def test_fold_accents_matches_ascii(self):
+        from custom.credential_extractor import normalize_for_matching
+        self.assertEqual(normalize_for_matching('José García'), normalize_for_matching('Jose Garcia'))
+
+    def test_email_inline_password_stops_at_colon(self):
+        creds = extract_credentials_from_line('alice@corp.com:Secret123:2021-05-01')
+        self.assertTrue(creds)
+        self.assertEqual(creds[0]['password'], 'Secret123')
+
+    def test_long_line_does_not_blow_up(self):
+        import time
+        line = 'ABCD/+' * 4000 + '.x'  # ~24KB, no trailing :password -> ReDoS trigger
+        start = time.time()
+        result = extract_credentials_from_line(line)
+        self.assertIsInstance(result, list)
+        self.assertLess(time.time() - start, 1.0)  # was multiple seconds before the guard
+
+    def test_blob_over_max_len_returns_empty(self):
+        self.assertEqual(extract_credentials_from_line('x' * 60000), [])
 
 
 if __name__ == '__main__':
