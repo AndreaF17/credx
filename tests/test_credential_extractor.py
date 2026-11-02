@@ -2,13 +2,17 @@ import unittest
 
 from custom.credential_extractor import (
     EXTRACTION_MODES,
+    build_name_search_terms,
     build_person_email_context,
+    build_person_name_context,
     build_search_terms,
     build_target_context,
     candidate_mentions_person_email,
+    candidate_mentions_person_name,
     candidate_mentions_target,
     extract_credentials_from_line,
     is_email_target,
+    looks_like_domain,
 )
 
 
@@ -199,6 +203,53 @@ class CredentialExtractorTests(unittest.TestCase):
         self.assertTrue(is_email_target('john.doe@example.com'))
         self.assertFalse(candidate_mentions_person_email(non_matching_candidate, non_matching_candidate['canonical'], context))
         self.assertTrue(candidate_mentions_person_email(matching_candidate, matching_candidate['canonical'], context))
+
+
+class DomainDetectionTests(unittest.TestCase):
+    def test_domains_detected(self):
+        self.assertTrue(looks_like_domain('corp.com'))
+        self.assertTrue(looks_like_domain('@corp.co.uk'))
+        self.assertTrue(looks_like_domain('acme'))  # bare single token -> domain selector
+
+    def test_names_are_not_domains(self):
+        self.assertFalse(looks_like_domain('John Doe'))
+        self.assertFalse(looks_like_domain('  jane  smith '))
+
+
+class UsernameOptInTests(unittest.TestCase):
+    def test_usernames_off_by_default(self):
+        self.assertEqual(build_search_terms('john.doe@corp.com'), ['john.doe@corp.com'])
+
+    def test_usernames_opt_in_adds_local_part_variants(self):
+        terms = {t.lower() for t in build_search_terms('john.doe@corp.com', include_usernames=True)}
+        self.assertIn('john.doe@corp.com', terms)
+        self.assertIn('john.doe', terms)
+        self.assertIn('john doe', terms)
+        self.assertIn('johndoe', terms)
+
+
+class PersonNameTargetTests(unittest.TestCase):
+    def test_name_search_terms_without_domain(self):
+        terms = build_name_search_terms('John Doe')
+        self.assertIn('John Doe', terms)
+        self.assertIn('johndoe', terms)
+        self.assertNotIn('@corp.com', terms)
+
+    def test_name_search_terms_with_domain_adds_selector(self):
+        terms = build_name_search_terms('John Doe', domain='corp.com')
+        self.assertIn('@corp.com', terms)
+
+    def test_name_plus_domain_requires_both(self):
+        ctx = build_person_name_context('John Doe', domain='corp.com')
+        hit = {'identity': 'john.doe@corp.com', 'url': 'app.corp.com', 'canonical': 'app.corp.com:john.doe@corp.com:pw'}
+        self.assertTrue(candidate_mentions_person_name(hit, 'john doe at corp.com', ctx))
+        wrong_domain = {'identity': 'john doe', 'url': '', 'canonical': 'john doe:pw'}
+        self.assertFalse(candidate_mentions_person_name(wrong_domain, 'john doe other.com', ctx))
+
+    def test_name_only_matches_on_name_alone(self):
+        ctx = build_person_name_context('John Doe')
+        cand = {'identity': 'john doe', 'url': '', 'canonical': 'x'}
+        self.assertTrue(candidate_mentions_person_name(cand, 'john doe:secret', ctx))
 
 
 if __name__ == '__main__':

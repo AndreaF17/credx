@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as html_lib
 import importlib
 import json
 import logging
@@ -33,13 +34,17 @@ from dotenv import load_dotenv
 from custom.credential_extractor import (
     DEFAULT_MODE,
     EXTRACTION_MODES,
+    build_name_search_terms,
     build_person_email_context,
+    build_person_name_context,
     build_search_terms,
     build_target_context,
     candidate_mentions_person_email,
+    candidate_mentions_person_name,
     candidate_mentions_target,
     extract_credentials_from_line,
     is_email_target,
+    looks_like_domain,
 )
 from custom.confidence_model import DEFAULT_MODEL_PATH, ConfidenceModel
 from custom.parser import anonymize_password, parse_line_candidates
@@ -63,8 +68,9 @@ RETRY_DELAY: float = 2.0
 REQUEST_DELAY: float = 0.5
 # Default number of concurrent FILE_VIEW workers. 1 preserves legacy sequential behavior.
 DEFAULT_WORKERS: int = 1
-# Default search range in months.
-DEFAULT_RANGE_MONTHS: int = 6
+# Default search range in months. Breached credentials are usually years old, so
+# the default reaches back two years; narrow it with --range when you want recency.
+DEFAULT_RANGE_MONTHS: int = 24
 # Default maximum results requested PER (search term, bucket) pair. IntelX stops
 # at this cap, so a low value silently truncates results for large domains; raise
 # it (at the cost of more rate-limited FILE_VIEW fetches) when coverage matters.
@@ -117,7 +123,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument('-m', '--maxresults', type=int, help='Maximum number of results to return', default=DEFAULT_MAX_RESULTS)
     parser.add_argument('-k', '--apikey', type=str, help='IntelX API key', required=False)
     parser.add_argument('-o', '--output', type=str, help='Output file to save the results', default=None)
-    parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv'], help='Output format (txt, json, csv)', default='txt')
+    parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv', 'html'], help='Output format (txt, json, csv, html)', default='txt')
     parser.add_argument('-r', '--range', type=int, help='Search range in months', default=DEFAULT_RANGE_MONTHS)
     parser.add_argument('-d', '--debug', action='store_true', help='Enable DEBUG logging (default: INFO)')
     parser.add_argument(
@@ -147,6 +153,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help='Optional full name to enrich person-email search terms',
+    )
+    parser.add_argument(
+        '--domain',
+        type=str,
+        default=None,
+        help='Company domain to anchor a person-name target (e.g. --target "John Doe" '
+             '--domain corp.com). Name matches are then required to co-occur with the '
+             'domain, cutting noise.',
+    )
+    parser.add_argument(
+        '--usernames', action='store_true',
+        help='For an email target, also search username/local-part variants '
+             '(john.doe -> "john doe", johndoe). Higher recall on username-indexed '
+             'combolists, more noise. Off by default.',
     )
     parser.add_argument(
         '--safe-share',
@@ -698,6 +718,12 @@ def load_existing_dedup(output_file: str, output_format: str, log: logging.Logge
                     password = row.get('password', '')
                     if identity and password:
                         seen.add(f"{identity.lower()}:{password}")
+        elif output_format == 'html':
+            for entry in _load_html_records(output_file, log):
+                identity = entry.get('identity') or entry.get('email', '')
+                password = entry.get('password', '')
+                if identity and password:
+                    seen.add(f"{identity.lower()}:{password}")
         else:  # txt
             with open(output_file, 'r') as f:
                 for line in f:
@@ -839,6 +865,7 @@ def _process_contents(
     stats: Dict[str, int],
     log: logging.Logger,
     scorer: Optional[ConfidenceModel] = None,
+    person_name_context: Any = None,
 ) -> int:
     """Extract, filter and dedup credentials from one leak's contents.
 
@@ -879,6 +906,8 @@ def _process_contents(
 
             if person_context:
                 target_match = candidate_mentions_person_email(candidate, line_stripped, person_context)
+            elif person_name_context:
+                target_match = candidate_mentions_person_name(candidate, line_stripped, person_name_context)
             else:
                 target_match = candidate_mentions_target(candidate, line_stripped, target_context)
 
@@ -936,6 +965,7 @@ def process_leaks(
     delay: float = REQUEST_DELAY,
     retry: RetryConfig = RetryConfig(),
     scorer: Optional[ConfidenceModel] = None,
+    person_name_context: Any = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Fetch and process every leak, optionally with bounded concurrency.
 
@@ -976,6 +1006,7 @@ def process_leaks(
                     stats=stats,
                     log=log,
                     scorer=scorer,
+                    person_name_context=person_name_context,
                 )
             except EXPECTED_LEAK_ERRORS as e:
                 log.error(f"Error processing leak {leak.get('name', 'unknown')}: {e}")
@@ -1123,6 +1154,241 @@ def write_txt_output(new_creds: List[Dict[str, Any]], output_file: str, log: log
     return len(new_creds)
 
 
+# ── HTML report ───────────────────────────────────────────────────────────────
+_HTML_DATA_RE = re.compile(
+    r'<script id="credx-data" type="application/json">(.*?)</script>',
+    re.DOTALL,
+)
+
+_HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1a1d21; --muted: #6b7280;
+    --border: #e5e7eb; --accent: #2563eb; --row: #fafbfc;
+    --hi: #dc2626; --mid: #d97706; --lo: #16a34a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #171b21; --text: #e6e8eb; --muted: #9aa4b2;
+      --border: #2a2f37; --accent: #60a5fa; --row: #1b2026;
+      --hi: #f87171; --mid: #fbbf24; --lo: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 20px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 2;
+  }
+  .controls input[type="search"] {
+    flex: 1 1 220px; min-width: 160px; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px;
+  }
+  .controls label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); cursor: pointer; }
+  .wrap { padding: 16px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 760px; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { color: var(--text); }
+  tbody tr:nth-child(even) { background: var(--row); }
+  td.pw { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; cursor: pointer; white-space: nowrap; }
+  td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .c-hi { color: var(--lo); } .c-mid { color: var(--mid); } .c-lo { color: var(--hi); }
+  .empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+  footer { padding: 16px; color: var(--muted); font-size: 12px; text-align: center; }
+  @media (max-width: 560px) { h1 { font-size: 18px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <div class="meta">Generated __GENERATED__ · <span id="count">__COUNT__</span> credential(s)</div>
+</header>
+<div class="controls">
+  <input type="search" id="q" placeholder="Filter by any field (identity, url, source, password…)" autocomplete="off">
+  <label><input type="checkbox" id="reveal"> Reveal passwords</label>
+</div>
+<div class="wrap">
+  <table>
+    <thead>
+      <tr>
+        <th data-k="date">Date</th>
+        <th data-k="source">Source</th>
+        <th data-k="url">URL</th>
+        <th data-k="identity">Identity</th>
+        <th data-k="password">Password</th>
+        <th data-k="confidence">Conf.</th>
+        <th data-k="pattern">Pattern</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>No credentials match your filter.</div>
+</div>
+<footer>Generated by credx · passwords are masked by default — click a password or toggle "Reveal passwords"</footer>
+
+<script id="credx-data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var raw = document.getElementById("credx-data").textContent || "[]";
+  var data = [];
+  try { data = JSON.parse(raw); } catch (e) { data = []; }
+  var tbody = document.getElementById("rows");
+  var empty = document.getElementById("empty");
+  var q = document.getElementById("q");
+  var reveal = document.getElementById("reveal");
+  var sortKey = "confidence", sortDir = -1;
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function confClass(c) {
+    c = Number(c) || 0;
+    return c >= 0.85 ? "c-hi" : (c >= 0.66 ? "c-mid" : "c-lo");
+  }
+  function mask(p) { return "•".repeat(Math.max(6, Math.min(16, String(p || "").length))); }
+
+  function render() {
+    var term = (q.value || "").toLowerCase().trim();
+    var showAll = reveal.checked;
+    var rows = data.filter(function (r) {
+      if (!term) return true;
+      return [r.identity, r.email, r.url, r.password, r.source, r.pattern, r.date]
+        .some(function (v) { return String(v || "").toLowerCase().indexOf(term) !== -1; });
+    });
+    rows.sort(function (a, b) {
+      var x = a[sortKey], y = b[sortKey];
+      if (sortKey === "confidence") { x = Number(x) || 0; y = Number(y) || 0; }
+      else { x = String(x || "").toLowerCase(); y = String(y || "").toLowerCase(); }
+      return x < y ? -sortDir : (x > y ? sortDir : 0);
+    });
+    tbody.innerHTML = rows.map(function (r) {
+      var pw = esc(r.password);
+      var shown = showAll ? pw : esc(mask(r.password));
+      var conf = (Number(r.confidence) || 0).toFixed(2);
+      return "<tr>" +
+        "<td>" + esc(r.date || "") + "</td>" +
+        "<td>" + esc(r.source || "") + "</td>" +
+        "<td class='mono'>" + esc(r.url || "") + "</td>" +
+        "<td class='mono'>" + esc(r.identity || r.email || "") + "</td>" +
+        "<td class='pw' data-pw='" + pw + "' title='click to toggle'>" + shown + "</td>" +
+        "<td><span class='pill " + confClass(r.confidence) + "'>" + conf + "</span></td>" +
+        "<td>" + esc(r.pattern || "") + "</td>" +
+        "</tr>";
+    }).join("");
+    empty.hidden = rows.length !== 0;
+    document.getElementById("count").textContent = rows.length;
+  }
+
+  tbody.addEventListener("click", function (e) {
+    var cell = e.target.closest ? e.target.closest("td.pw") : null;
+    if (!cell) return;
+    var real = cell.getAttribute("data-pw");
+    var masked = cell.textContent.indexOf("•") !== -1;
+    cell.textContent = masked ? (real || "") : real.replace(/./g, "•");
+  });
+  document.querySelectorAll("th[data-k]").forEach(function (th) {
+    th.addEventListener("click", function () {
+      var k = th.getAttribute("data-k");
+      if (sortKey === k) { sortDir = -sortDir; } else { sortKey = k; sortDir = k === "confidence" ? -1 : 1; }
+      render();
+    });
+  });
+  q.addEventListener("input", render);
+  reveal.addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _dedup_key(cred: Dict[str, Any]) -> str:
+    identity = (cred.get('identity') or cred.get('email') or '')
+    return f"{identity.lower()}:{cred.get('password', '')}"
+
+
+def _load_html_records(output_file: str, log: logging.Logger) -> List[Dict[str, Any]]:
+    """Parse the records embedded in a credx HTML report (for resume/accumulate)."""
+    if not os.path.exists(output_file):
+        return []
+    try:
+        with open(output_file, 'r') as f:
+            match = _HTML_DATA_RE.search(f.read())
+        if not match:
+            return []
+        data = json.loads(match.group(1).replace('<\\/', '</'))
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError) as e:
+        log.warning(f"Could not parse existing HTML report ({e}); starting fresh")
+        return []
+
+
+def _render_html_report(records: List[Dict[str, Any]]) -> str:
+    """Render a self-contained, interactive HTML credential report."""
+    generated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    payload = json.dumps(records, ensure_ascii=False).replace('</', '<\\/')
+    return (
+        _HTML_TEMPLATE
+        .replace('__TITLE__', html_lib.escape('credx — credential report'))
+        .replace('__GENERATED__', html_lib.escape(generated))
+        .replace('__COUNT__', str(len(records)))
+        .replace('__DATA__', payload)
+    )
+
+
+def write_html_output(new_creds: List[Dict[str, Any]], output_file: str, log: logging.Logger) -> int:
+    """Write an interactive HTML report, merging with any existing report.
+
+    The report embeds its own records as JSON, so re-runs accumulate and dedup
+    just like the JSON/CSV formats. Returns the number of newly added rows.
+    """
+    existing = _load_html_records(output_file, log)
+    merged: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for cred in existing:
+        key = _dedup_key(cred)
+        if key not in seen:
+            seen.add(key)
+            merged.append(cred)
+
+    added = 0
+    for cred in new_creds:
+        key = _dedup_key(cred)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(cred)
+        added += 1
+
+    directory = os.path.dirname(output_file) or '.'
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{output_file}.tmp"
+    with open(tmp, 'w') as f:
+        f.write(_render_html_report(merged))
+    os.replace(tmp, output_file)
+    return added
+
+
 def write_output(
     new_creds: List[Dict[str, Any]],
     output_file: str,
@@ -1134,6 +1400,8 @@ def write_output(
         return write_json_output(new_creds, output_file, log)
     if output_format == 'csv':
         return write_csv_output(new_creds, output_file, log)
+    if output_format == 'html':
+        return write_html_output(new_creds, output_file, log)
     return write_txt_output(new_creds, output_file, log)
 
 
@@ -1162,22 +1430,55 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     target = args.target
     target_is_email = is_email_target(target)
+    # Person-name mode: a non-email, non-domain target (e.g. "John Doe"), or any
+    # non-email target paired with --domain.
+    target_is_person_name = (not target_is_email) and (
+        not looks_like_domain(target) or bool(args.domain)
+    )
+
     target_context = build_target_context(target)
     person_context = (
         build_person_email_context(target, person_name=args.person_name) if target_is_email else None
     )
+    person_name_context = (
+        build_person_name_context(target, domain=args.domain) if target_is_person_name else None
+    )
 
     if args.person_name and not target_is_email:
         log.warning("--person-name is most useful with an email target and will be ignored for domain targets")
+    if args.domain and (target_is_email or looks_like_domain(target)):
+        log.warning("--domain only applies to a person-name target; ignoring it here")
 
-    search_terms = build_search_terms(
-        target,
-        include_email_pattern=args.email,
-        person_name=args.person_name,
-        company_wide=args.company_wide,
-    )
-    if target_is_email:
+    if target_is_person_name:
+        search_terms = build_name_search_terms(target, domain=args.domain)
+    else:
+        search_terms = build_search_terms(
+            target,
+            include_email_pattern=args.email,
+            person_name=args.person_name,
+            company_wide=args.company_wide,
+            include_usernames=args.usernames,
+        )
+
+    if not search_terms:
+        log.error(f"Could not build any search terms for target '{target}'")
+        return 1
+
+    if target_is_person_name:
+        if args.domain:
+            log.info(
+                f"Person-name mode: {len(search_terms)} term(s) for '{target}', "
+                f"anchored to domain '{args.domain}'."
+            )
+        else:
+            log.warning(
+                f"Person-name mode without --domain: searching '{target}' broadly. "
+                "Results will be noisy; pass --domain corp.com to anchor matches."
+            )
+    elif target_is_email:
         log.info(f"Person-email mode enabled. Generated {len(search_terms)} search terms for '{target}'.")
+        if args.usernames:
+            log.info("Username search enabled: also sweeping username/local-part variants")
     else:
         log.info(f"Domain mode: searching selector(s) {search_terms}")
         if args.company_wide:
@@ -1232,6 +1533,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         target=target,
         target_context=target_context,
         person_context=person_context,
+        person_name_context=person_name_context,
         seen=seen,
         log=log,
         workers=args.workers,

@@ -197,11 +197,37 @@ def _derive_person_name_variants(email, person_name=None, include_local_from_ema
     return variants
 
 
-def build_search_terms(target, include_email_pattern=False, person_name=None, company_wide=False):
+def looks_like_domain(target):
+    """True when ``target`` looks like a domain (or @domain), not a person name.
+
+    A domain has no whitespace and ends in a dotted, alphabetic TLD
+    (``corp.com``, ``@corp.co.uk``). Bare single words without a dot are treated
+    as domains too (the historical behavior), so only multi-word targets fall
+    through to person-name mode.
+    """
+    value = normalize_obfuscations(target.strip()).lstrip('@')
+    if not value or any(ch.isspace() for ch in value):
+        return False
+    if _HOST_TLD_PATTERN.search(value):
+        return True
+    # Single bare token with no dot: keep historical domain-selector behavior.
+    return '.' not in value
+
+
+def build_search_terms(
+    target,
+    include_email_pattern=False,
+    person_name=None,
+    company_wide=False,
+    include_usernames=False,
+):
     """Build IntelX search terms for domain/email/person targeting.
 
     Email target: the exact email first, plus optional person-name variants and
-    (with ``include_email_pattern``) the ``@domain`` pattern.
+    (with ``include_email_pattern``) the ``@domain`` pattern. With
+    ``include_usernames`` it also searches username/local-part variants derived
+    from the address (``john.doe`` -> ``john doe``, ``johndoe``) — higher recall
+    on username-indexed combolists, at the cost of more noise.
 
     Domain target: the ``@domain`` *email selector* by default. It matches leaked
     account rows (``alice@domain:password``) while skipping the company-mention
@@ -219,12 +245,13 @@ def build_search_terms(target, include_email_pattern=False, person_name=None, co
         email_value = target_normalized.lower()
         _, _, domain = email_value.partition('@')
 
-        # Default behavior: exact email only.
-        if person_name:
+        # Default behavior: exact email only. Person-name and username variants
+        # broaden recall only when explicitly requested.
+        if person_name or include_usernames:
             for variant in _derive_person_name_variants(
                 email_value,
                 person_name=person_name,
-                include_local_from_email=False,
+                include_local_from_email=include_usernames,
             ):
                 _add_unique(terms, seen, variant)
 
@@ -240,6 +267,86 @@ def build_search_terms(target, include_email_pattern=False, person_name=None, co
         _add_unique(terms, seen, domain_plain)
 
     return terms
+
+
+def build_name_search_terms(person_name, domain=None):
+    """Build IntelX search terms for a person-name target.
+
+    Searches full-name variants (``"John Doe"``, ``johndoe``). When ``domain``
+    is given, it also searches the ``@domain`` selector so results can be
+    anchored to the person's organization.
+    """
+    terms = []
+    seen = set()
+    for variant in _derive_person_name_variants('', person_name=person_name):
+        _add_unique(terms, seen, variant)
+    if domain:
+        domain_plain = normalize_obfuscations(domain.strip()).lstrip('@').lower()
+        if domain_plain:
+            _add_unique(terms, seen, f"@{domain_plain}")
+    return terms
+
+
+def build_person_name_context(person_name, domain=None):
+    """Build matching context for a person-name target.
+
+    ``name_variants`` holds normalized name forms to look for. When ``domain`` is
+    set, matches are anchored: a line must mention both a name variant and the
+    domain. Without a domain, a name variant alone matches (noisier).
+    """
+    name_variants = _derive_person_name_variants('', person_name=person_name)
+    normalized_variants = {
+        normalize_for_matching(variant.strip('"'))
+        for variant in name_variants
+        if variant.strip('"')
+    }
+    domain_plain = (
+        normalize_obfuscations(domain.strip()).lstrip('@').lower() if domain else ''
+    )
+    return {
+        'name_variants': {v.strip('"').lower() for v in name_variants if v.strip('"')},
+        'name_normalized': {v for v in normalized_variants if v},
+        'domain': domain_plain,
+        'domain_normalized': normalize_for_matching(domain_plain) if domain_plain else '',
+    }
+
+
+def candidate_mentions_person_name(candidate, raw_line, person_context):
+    """Match a candidate against a person-name target.
+
+    With a domain, requires a name variant AND the domain in the same context.
+    Without a domain, a name variant alone is enough.
+    """
+    texts = [
+        raw_line,
+        candidate.get('identity', ''),
+        candidate.get('url', ''),
+        candidate.get('canonical', ''),
+    ]
+    domain_norm = person_context.get('domain_normalized', '')
+
+    for text in texts:
+        if not text:
+            continue
+        lowered = normalize_obfuscations(text).lower()
+        normalized = normalize_for_matching(text)
+
+        name_hit = any(
+            variant and variant in lowered
+            for variant in person_context.get('name_variants', ())
+        ) or any(
+            variant and variant in normalized
+            for variant in person_context.get('name_normalized', ())
+        )
+        if not name_hit:
+            continue
+
+        if not domain_norm:
+            return True
+        if domain_norm in normalized:
+            return True
+
+    return False
 
 
 def build_target_context(target):

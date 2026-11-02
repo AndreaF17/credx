@@ -613,5 +613,55 @@ class ColorHelperTests(unittest.TestCase):
         self.assertIn('balanced', out)
 
 
+class HtmlOutputTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = _silent_logger()
+        self.path = os.path.join(self.tmp.name, 'report.html')
+
+    def _cred(self, identity, password, **extra):
+        base = {
+            'url': 'https://app.corp.com', 'identity': identity, 'email': identity,
+            'password': password, 'source': 'leak.txt', 'date': '2023-01-01',
+            'confidence': 0.9, 'pattern': 'url_delimited', 'canonical': 'c', 'raw_line': 'r',
+        }
+        base.update(extra)
+        return base
+
+    def test_writes_report_with_embedded_records(self):
+        n = main.write_html_output([self._cred('a@corp.com', 'p1')], self.path, self.log)
+        self.assertEqual(n, 1)
+        recs = main._load_html_records(self.path, self.log)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]['identity'], 'a@corp.com')
+
+    def test_resume_accumulates_and_dedups(self):
+        main.write_html_output([self._cred('a@corp.com', 'p1')], self.path, self.log)
+        added = main.write_html_output(
+            [self._cred('a@corp.com', 'p1'), self._cred('b@corp.com', 'p2')],
+            self.path, self.log,
+        )
+        self.assertEqual(added, 1)  # only the new one
+        self.assertEqual(len(main._load_html_records(self.path, self.log)), 2)
+
+    def test_load_existing_dedup_reads_html(self):
+        main.write_html_output([self._cred('a@corp.com', 'p1')], self.path, self.log)
+        seen = main.load_existing_dedup(self.path, 'html', self.log)
+        self.assertIn('a@corp.com:p1', seen)
+
+    def test_script_payload_is_injection_safe(self):
+        n = main.write_html_output([self._cred('a@corp.com', 'pw</script><b>x')], self.path, self.log)
+        self.assertEqual(n, 1)
+        with open(self.path) as f:
+            html = f.read()
+        # The raw closing tag must not appear inside the embedded data block.
+        data_block = html.split('id="credx-data"', 1)[1].split('</script>', 1)[0]
+        self.assertNotIn('</script', data_block)
+        # …but the value round-trips intact.
+        recs = main._load_html_records(self.path, self.log)
+        self.assertEqual(recs[0]['password'], 'pw</script><b>x')
+
+
 if __name__ == '__main__':
     unittest.main()
