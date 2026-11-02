@@ -15,6 +15,7 @@ import argparse
 import csv
 import html as html_lib
 import importlib
+import io
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from custom.credential_extractor import (
     candidate_mentions_person_name,
     candidate_mentions_target,
     extract_credentials_from_line,
+    has_dotted_tld,
     is_email_target,
     looks_like_domain,
 )
@@ -99,6 +101,12 @@ except ImportError:  # pragma: no cover
     _NETWORK_ERRORS = ()
 
 EXPECTED_LEAK_ERRORS: Tuple[type, ...] = (OSError, ValueError, KeyError, TypeError) + _NETWORK_ERRORS
+
+
+class AllSearchesFailed(Exception):
+    """Raised when every (term, bucket) search failed — usually a systemic cause
+    (invalid/expired API key, exhausted quota, rate limiting, or IntelX down),
+    which must not be reported to the user as a clean 'no credentials' result."""
 
 
 def load_intelx_client() -> Optional[Any]:
@@ -218,6 +226,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error('--workers must be >= 1')
     if args.delay < 0:
         parser.error('--delay must be >= 0')
+    if args.range < 1:
+        parser.error('--range must be >= 1 (months)')
+    if args.maxresults < 1:
+        parser.error('--maxresults must be >= 1')
 
     return args
 
@@ -284,6 +296,10 @@ def configure_logging(debug: bool) -> logging.Logger:
 def resolve_api_key(args: argparse.Namespace, log: logging.Logger) -> Optional[str]:
     """Resolve the IntelX API key from the CLI flag or the environment."""
     if args.apikey:
+        log.warning(
+            "API key passed via --apikey is visible in your shell history and the process list; "
+            "prefer INTELX_API_KEY in a .env file."
+        )
         return args.apikey
     load_dotenv()
     api_key = os.getenv('INTELX_API_KEY')
@@ -292,11 +308,23 @@ def resolve_api_key(args: argparse.Namespace, log: logging.Logger) -> Optional[s
     return api_key
 
 
+def sanitize_filename(value: str, fallback: str = 'output') -> str:
+    """Reduce a user/target-derived string to a safe bare filename.
+
+    Strips any directory components and ``..`` so output can never escape the
+    ``out/`` directory (e.g. a target of ``../../etc/x`` or ``a/b``).
+    """
+    name = os.path.basename(str(value).replace('\\', '/').strip())
+    name = name.strip('. ')  # no leading dots / stray spaces, no bare ".."
+    return name or fallback
+
+
 def resolve_output_path(args: argparse.Namespace) -> str:
     """Compute the main output file path inside the ``out/`` directory."""
     if not args.output:
-        return f"out/{args.target}-creds.{args.format}"
-    return f"out/{args.output}"
+        target = sanitize_filename(args.target, fallback='target')
+        return os.path.join('out', f"{target}-creds.{args.format}")
+    return os.path.join('out', sanitize_filename(args.output))
 
 
 def compute_date_range(range_months: int, now: Optional[datetime] = None) -> Tuple[str, str]:
@@ -322,7 +350,7 @@ def resolve_safe_output_path(main_output_path: str, safe_output_arg: Optional[st
 def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -> Iterator[Dict[str, str]]:
     """Yield normalized credential dicts from the main output file."""
     if output_format == 'json':
-        with open(main_output_path, 'r') as f:
+        with open(main_output_path, 'r', encoding='utf-8') as f:
             entries = json.load(f)
 
         if isinstance(entries, list):
@@ -336,7 +364,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                 }
 
     elif output_format == 'csv':
-        with open(main_output_path, 'r') as f:
+        with open(main_output_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 yield {
@@ -358,7 +386,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
             }
 
     else:  # txt
-        with open(main_output_path, 'r') as f:
+        with open(main_output_path, 'r', encoding='utf-8') as f:
             for line in f:
                 # Lines are "<date> | <canonical>"; split the date prefix back off.
                 date = ''
@@ -394,21 +422,17 @@ def write_safe_share_file(main_output_path: str, output_format: str, safe_output
         seen.add(dedup_key)
 
         safe_rows.append({
-            'TARGET': cred.get('url', ''),
-            'User': identity,
-            'Password': anonymize_password(password),
-            'Date': cred.get('date', ''),
-            'Source': cred.get('source', ''),
+            'TARGET': _csv_safe(cred.get('url', '')),
+            'User': _csv_safe(identity),
+            'Password': _csv_safe(anonymize_password(password)),
+            'Date': _csv_safe(cred.get('date', '')),
+            'Source': _csv_safe(cred.get('source', '')),
         })
 
     if not safe_rows:
         return 0
 
-    safe_dir = os.path.dirname(safe_output_path)
-    if safe_dir:
-        os.makedirs(safe_dir, exist_ok=True)
-
-    with open(safe_output_path, 'w', newline='') as f:
+    with _secure_open(safe_output_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['TARGET', 'User', 'Password', 'Date', 'Source'], delimiter=';')
         writer.writeheader()
         writer.writerows(safe_rows)
@@ -426,12 +450,20 @@ def run_search(
     max_results: int,
     log: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """Search every (term, bucket) pair and return storageid-deduplicated records."""
+    """Search every (term, bucket) pair and return storageid-deduplicated records.
+
+    Raises :class:`AllSearchesFailed` if *every* search errored, so a systemic
+    failure (bad key, quota, outage) is not mistaken for an empty result.
+    """
     all_results: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
+    searches = 0
+    failures = 0
+    last_error: Optional[BaseException] = None
 
     for term in search_terms:
         for bucket in buckets:
+            searches += 1
             log.debug(f"Searching bucket '{bucket}' for '{term}'...")
             try:
                 try:
@@ -454,17 +486,29 @@ def run_search(
                         raise
 
                 records = response.get('records') if isinstance(response, dict) else []
-                if not records:
-                    records = []
+                if not isinstance(records, list):
+                    records = []  # API returned a non-list (e.g. null) for records
                 for r in records:
+                    if not isinstance(r, dict):
+                        continue  # skip malformed record entries
                     sid = r.get('storageid')
                     if sid and sid not in seen_ids:
                         seen_ids.add(sid)
                         all_results.append(r)
                 log.debug(f"  -> {len(records)} records from {bucket} for '{term}'")
             except EXPECTED_LEAK_ERRORS as e:
+                failures += 1
+                last_error = e
                 log.warning(f"Bucket '{bucket}' failed for '{term}': {e}")
                 continue
+
+    if searches and failures == searches:
+        raise AllSearchesFailed(
+            f"all {searches} IntelX search(es) failed (last error: {last_error}). "
+            "Check your API key, remaining quota, and connectivity."
+        )
+    if failures:
+        log.warning(f"{failures}/{searches} IntelX searches failed; results may be incomplete")
 
     log.info(f"Found {len(all_results)} unique results across all buckets")
     return all_results
@@ -656,6 +700,7 @@ def run_phonebook_search(
             continue
 
         remaining = max_results
+        empty_streak = 0
         for _ in range(_PHONEBOOK_MAX_PAGES):
             try:
                 page = ix.PHONEBOOK_SEARCH_RESULT(search_id, limit=max(remaining, 1))
@@ -678,8 +723,21 @@ def run_phonebook_search(
             # 1 = no more results, 2 = search id not found; 0/3 = keep polling.
             if status in (1, 2) or remaining <= 0:
                 break
+            # Guard against busy-polling empty, non-terminal pages forever.
+            if not page_selectors:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    log.debug(f"Phonebook returned empty pages repeatedly for '{bucket}'; stopping")
+                    break
+            else:
+                empty_streak = 0
             if poll_delay:
                 time.sleep(poll_delay)
+        else:
+            log.warning(
+                f"Phonebook hit the {_PHONEBOOK_MAX_PAGES}-page cap for '{bucket}'; "
+                "results may be truncated (raise -m or narrow --range)."
+            )
 
     log.info(f"Phonebook discovery found {len(selectors)} unique selector(s)")
     return selectors
@@ -687,11 +745,8 @@ def run_phonebook_search(
 
 def write_phonebook_output(selectors: Iterable[str], output_path: str, log: logging.Logger) -> int:
     """Write discovered selectors (one per line) to ``output_path``; returns the count."""
-    directory = os.path.dirname(output_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
     written = 0
-    with open(output_path, 'w') as f:
+    with _secure_open(output_path, 'w') as f:
         for selector in selectors:
             f.write(f"{selector}\n")
             written += 1
@@ -713,29 +768,25 @@ def load_existing_dedup(output_file: str, output_format: str, log: logging.Logge
     log.info(f"Resuming: loading existing credentials from {output_file}")
     try:
         if output_format == 'json':
-            with open(output_file, 'r') as f:
+            with open(output_file, 'r', encoding='utf-8') as f:
                 existing = json.load(f)
+            if not isinstance(existing, list):
+                existing = []  # a valid-JSON non-list is not our format; ignore it
             for entry in existing:
-                identity = entry.get('identity') or entry.get('email', '')
-                password = entry.get('password', '')
-                if identity and password:
-                    seen.add(f"{identity.lower()}:{password}")
+                if isinstance(entry, dict) and entry.get('password'):
+                    seen.add(_dedup_key(entry))
         elif output_format == 'csv':
-            with open(output_file, 'r') as f:
+            with open(output_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    identity = row.get('identity') or row.get('email', '')
-                    password = row.get('password', '')
-                    if identity and password:
-                        seen.add(f"{identity.lower()}:{password}")
+                    if row.get('password'):
+                        seen.add(_dedup_key(row))
         elif output_format == 'html':
             for entry in _load_html_records(output_file, log):
-                identity = entry.get('identity') or entry.get('email', '')
-                password = entry.get('password', '')
-                if identity and password:
-                    seen.add(f"{identity.lower()}:{password}")
+                if isinstance(entry, dict) and entry.get('password'):
+                    seen.add(_dedup_key(entry))
         else:  # txt
-            with open(output_file, 'r') as f:
+            with open(output_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -758,11 +809,22 @@ def file_view_with_retry(
     log: logging.Logger,
     retry: RetryConfig = RetryConfig(),
 ) -> str:
-    """Call FILE_VIEW with exponential backoff retry. Re-raises after the last attempt."""
+    """Call FILE_VIEW with exponential backoff retry. Re-raises after the last attempt.
+
+    The result is always coerced to ``str`` (``None`` -> ``''``, ``bytes`` decoded),
+    so callers can split it safely regardless of what the SDK returns.
+    """
+    # Resolve the record's fields once: a missing field is a deterministic error,
+    # so fail immediately instead of wasting the exponential-backoff retries on it.
+    try:
+        view_args = (leak['type'], leak['media'], leak['storageid'], leak['bucket'])
+    except KeyError as e:
+        raise KeyError(f"leak record missing required field {e}") from e
+
     delay = retry.retry_delay
     for attempt in range(1, retry.max_retries + 1):
         try:
-            return ix.FILE_VIEW(leak['type'], leak['media'], leak['storageid'], leak['bucket'])
+            return _coerce_contents(ix.FILE_VIEW(*view_args))
         except EXPECTED_LEAK_ERRORS as e:
             if attempt == retry.max_retries:
                 raise
@@ -770,6 +832,15 @@ def file_view_with_retry(
             time.sleep(delay)
             delay *= 2
     return ""
+
+
+def _coerce_contents(contents: Any) -> str:
+    """Coerce a FILE_VIEW result to text: None -> '', bytes -> decoded str."""
+    if contents is None:
+        return ""
+    if isinstance(contents, bytes):
+        return contents.decode('utf-8', 'replace')
+    return contents if isinstance(contents, str) else str(contents)
 
 
 # ── Rate limiting & progress ─────────────────────────────────────────────────
@@ -867,7 +938,6 @@ def _process_contents(
     leak: Dict[str, Any],
     *,
     mode: str,
-    target: str,
     target_context: Any,
     person_context: Any,
     seen: Set[str],
@@ -890,7 +960,9 @@ def _process_contents(
     min_confidence = EXTRACTION_MODES[mode]['min_confidence']
     accepted_total = 0
 
-    for line in contents.split('\n'):
+    # Iterate lines lazily (StringIO) rather than materializing a full list from
+    # contents.split('\n'); large stealer-log dumps can be tens of MB.
+    for line in io.StringIO(contents):
         line_stripped = line.strip()
         if not line_stripped:
             continue
@@ -945,7 +1017,6 @@ def _process_contents(
                 'source': leak.get('name', 'unknown'),
                 'date': _leak_date(leak),
                 'raw_line': line_stripped,
-                'raw': line_stripped,
                 'canonical': candidate['canonical'],
                 'confidence': candidate['confidence'],
                 'pattern': candidate['pattern'],
@@ -966,7 +1037,6 @@ def process_leaks(
     results: List[Dict[str, Any]],
     *,
     mode: str,
-    target: str,
     target_context: Any,
     person_context: Any,
     seen: Set[str],
@@ -1008,7 +1078,6 @@ def process_leaks(
                     contents,
                     leak,
                     mode=mode,
-                    target=target,
                     target_context=target_context,
                     person_context=person_context,
                     seen=seen,
@@ -1030,9 +1099,21 @@ def process_leaks(
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [executor.submit(handle, i, leak) for i, leak in enumerate(results)]
-                for future in as_completed(futures):
-                    # Surface genuinely unexpected errors instead of swallowing them.
-                    future.result()
+                try:
+                    for future in as_completed(futures):
+                        # Surface genuinely unexpected errors instead of swallowing them.
+                        future.result()
+                except KeyboardInterrupt:
+                    for f in futures:
+                        f.cancel()
+                    raise
+    except KeyboardInterrupt:
+        # Keep whatever was collected so the caller can persist a resumable
+        # partial file instead of discarding the whole (often long) run.
+        log.warning(
+            f"Interrupted — keeping {len(new_creds)} credential(s) collected so far; "
+            "re-run the same command to resume."
+        )
     finally:
         progress.close()
 
@@ -1040,12 +1121,54 @@ def process_leaks(
 
 
 # ── Output writing ───────────────────────────────────────────────────────────
+def _priv_opener(path: str, flags: int) -> int:
+    """opener= for open(): create credential files with 0o600 (owner-only)."""
+    return os.open(path, flags, 0o600)
+
+
+def _secure_open(path: str, mode: str, **kwargs: Any):
+    """open() for credential files: owner-only perms, UTF-8 text, hardened dir.
+
+    Leaked credentials are sensitive; files are created 0o600 inside an 0o700
+    ``out/`` directory, and a pre-existing file is tightened to 0o600 on append.
+    """
+    directory = os.path.dirname(path) or '.'
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    pre_exists = os.path.exists(path)
+    if 'b' not in mode:
+        kwargs.setdefault('encoding', 'utf-8')
+    handle = open(path, mode, opener=_priv_opener, **kwargs)
+    if pre_exists:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return handle
+
+
+# Cells beginning with these are interpreted as formulas by spreadsheet apps; a
+# leading apostrophe neutralizes them (CSV injection defense).
+_CSV_INJECTION_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _csv_safe(value: Any) -> str:
+    """Neutralize spreadsheet formula injection in a CSV cell."""
+    text = '' if value is None else str(value)
+    if text[:1] in _CSV_INJECTION_PREFIXES:
+        return "'" + text
+    return text
+
+
 def _load_json_entries(output_file: str, log: logging.Logger) -> List[Dict[str, Any]]:
     """Load existing JSON entries, recovering gracefully from corruption."""
     if not os.path.exists(output_file):
         return []
     try:
-        with open(output_file, 'r') as f:
+        with open(output_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except (json.JSONDecodeError, ValueError, OSError) as e:
         backup = output_file + '.corrupt'
@@ -1067,7 +1190,7 @@ def _atomic_write_json(output_file: str, entries: List[Dict[str, Any]]) -> None:
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{output_file}.tmp.{os.getpid()}"
     try:
-        with open(tmp_path, 'w') as f:
+        with _secure_open(tmp_path, 'w') as f:
             json.dump(entries, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
@@ -1093,13 +1216,11 @@ def _existing_csv_keys(output_file: str, log: logging.Logger) -> Set[str]:
     if not (os.path.exists(output_file) and os.path.getsize(output_file) > 0):
         return keys
     try:
-        with open(output_file, 'r') as f:
+        with open(output_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                identity = row.get('identity') or row.get('email', '')
-                password = row.get('password', '')
-                if identity and password:
-                    keys.add(f"{identity.lower()}:{password}")
+                if row.get('password'):
+                    keys.add(_dedup_key(row))
     except (OSError, csv.Error) as e:
         log.warning(f"Could not re-read existing CSV for dedup ({e}); relying on in-memory set")
     return keys
@@ -1130,9 +1251,7 @@ def write_csv_output(new_creds: List[Dict[str, Any]], output_file: str, log: log
 
     rows: List[Dict[str, Any]] = []
     for cred in new_creds:
-        identity = (cred.get('identity') or '')
-        password = cred.get('password', '')
-        key = f"{identity.lower()}:{password}"
+        key = _dedup_key(cred)
         if key in on_disk:
             continue
         on_disk.add(key)
@@ -1141,22 +1260,18 @@ def write_csv_output(new_creds: List[Dict[str, Any]], output_file: str, log: log
     if not rows and file_exists:
         return 0
 
-    directory = os.path.dirname(output_file) or '.'
-    os.makedirs(directory, exist_ok=True)
-    with open(output_file, 'a', newline='') as f:
+    with _secure_open(output_file, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         if not file_exists:
             writer.writeheader()
         for cred in rows:
-            writer.writerow({key: cred.get(key, '') for key in CSV_FIELDNAMES})
+            writer.writerow({key: _csv_safe(cred.get(key, '')) for key in CSV_FIELDNAMES})
     return len(rows)
 
 
 def write_txt_output(new_creds: List[Dict[str, Any]], output_file: str, log: logging.Logger) -> int:
     """Append canonical credential strings to a plain-text file."""
-    directory = os.path.dirname(output_file) or '.'
-    os.makedirs(directory, exist_ok=True)
-    with open(output_file, 'a') as f:
+    with _secure_open(output_file, 'a') as f:
         for cred in new_creds:
             # "<date> | <canonical>" — the leading ' | ' is a chunk boundary for the
             # extractor, so the line still re-parses cleanly on resume/safe-share.
@@ -1342,7 +1457,7 @@ def _load_html_records(output_file: str, log: logging.Logger) -> List[Dict[str, 
     if not os.path.exists(output_file):
         return []
     try:
-        with open(output_file, 'r') as f:
+        with open(output_file, 'r', encoding='utf-8') as f:
             match = _HTML_DATA_RE.search(f.read())
         if not match:
             return []
@@ -1399,12 +1514,19 @@ def write_html_output(new_creds: List[Dict[str, Any]], output_file: str, log: lo
         merged.append(cred)
         added += 1
 
-    directory = os.path.dirname(output_file) or '.'
-    os.makedirs(directory, exist_ok=True)
-    tmp = f"{output_file}.tmp"
-    with open(tmp, 'w') as f:
-        f.write(_render_html_report(merged))
-    os.replace(tmp, output_file)
+    tmp = f"{output_file}.tmp.{os.getpid()}"
+    try:
+        with _secure_open(tmp, 'w') as f:
+            f.write(_render_html_report(merged))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, output_file)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     return added
 
 
@@ -1449,10 +1571,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     target = args.target
     target_is_email = is_email_target(target)
-    # Person-name mode: a non-email, non-domain target (e.g. "John Doe"), or any
-    # non-email target paired with --domain.
+    # Person-name mode: a non-email, non-domain target (e.g. "John Doe"). A bare
+    # single-token target (no dotted TLD) paired with --domain is also a person
+    # name; a real domain (corp.com) stays in domain mode even with --domain.
     target_is_person_name = (not target_is_email) and (
-        not looks_like_domain(target) or bool(args.domain)
+        not looks_like_domain(target) or (bool(args.domain) and not has_dotted_tld(target))
     )
 
     target_context = build_target_context(target)
@@ -1463,10 +1586,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         build_person_name_context(target, domain=args.domain) if target_is_person_name else None
     )
 
+    # Flag-applicability feedback: warn when a flag has no effect for this target type.
     if args.person_name and not target_is_email:
-        log.warning("--person-name is most useful with an email target and will be ignored for domain targets")
-    if args.domain and (target_is_email or looks_like_domain(target)):
+        log.warning("--person-name only enriches an email target; ignoring it here")
+    if args.domain and not target_is_person_name:
         log.warning("--domain only applies to a person-name target; ignoring it here")
+    if args.email and not target_is_email:
+        log.warning("--email only applies to an email target; ignoring it here")
+    if args.usernames and not target_is_email:
+        log.warning("--usernames only applies to an email target; ignoring it here")
+    if args.company_wide and target_is_email:
+        log.warning("--company-wide only applies to a domain target; ignoring it here")
 
     if target_is_person_name:
         search_terms = build_name_search_terms(target, domain=args.domain)
@@ -1482,6 +1612,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not search_terms:
         log.error(f"Could not build any search terms for target '{target}'")
         return 1
+
+    # Load the ML model (if any) BEFORE the rate-limited search, so a bad --model
+    # path fails fast instead of after the whole run.
+    scorer: Optional[ConfidenceModel] = None
+    if args.model:
+        scorer = ConfidenceModel.load(args.model)
+        if scorer is None:
+            log.warning(
+                f"Confidence model not usable at '{args.model}'; falling back to heuristic scoring. "
+                "Train one with: credx-train"
+            )
+        else:
+            log.info(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
 
     if target_is_person_name:
         if args.domain:
@@ -1510,6 +1653,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
         if args.expand_archives:
             results = expand_container_leaks(ix, results, log)
+    except AllSearchesFailed as e:
+        log.error(str(e))
+        return 2
     except EXPECTED_LEAK_ERRORS as e:
         log.error(f"Error searching IntelX API: {e}")
         return 1
@@ -1527,21 +1673,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if value.lower() not in discovered_seen:
                         discovered_seen.add(value.lower())
                         discovered.append(value)
-            emails_path = os.path.join('out', f"{args.target}-emails.txt")
+            emails_path = os.path.join('out', f"{sanitize_filename(args.target, fallback='target')}-emails.txt")
             write_phonebook_output(discovered, emails_path, log)
         except EXPECTED_LEAK_ERRORS as e:
             log.error(f"Phonebook discovery failed: {e}")
-
-    scorer: Optional[ConfidenceModel] = None
-    if args.model:
-        scorer = ConfidenceModel.load(args.model)
-        if scorer is None:
-            log.warning(
-                f"Confidence model not usable at '{args.model}'; falling back to heuristic scoring. "
-                "Train one with: python train_confidence_model.py"
-            )
-        else:
-            log.info(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
 
     seen = load_existing_dedup(output_file, args.format, log)
 
@@ -1549,7 +1684,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         ix,
         results,
         mode=args.mode,
-        target=target,
         target_context=target_context,
         person_context=person_context,
         person_name_context=person_name_context,

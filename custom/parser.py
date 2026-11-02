@@ -6,6 +6,15 @@ import sys
 from custom.credential_extractor import extract_credentials_from_line
 
 
+_CSV_INJECTION_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def csv_safe(value):
+    """Neutralize spreadsheet formula injection in a CSV cell."""
+    text = '' if value is None else str(value)
+    return ("'" + text) if text[:1] in _CSV_INJECTION_PREFIXES else text
+
+
 def anonymize_password(password):
     """Anonymize the middle of a password with asterisks.
     Keeps first and last character visible, replaces the rest with *."""
@@ -32,7 +41,7 @@ def main():
     parsed = []
     seen = set()
     try:
-        with open(args.input, 'r') as f:
+        with open(args.input, 'r', encoding='utf-8') as f:
             for line in f:
                 results = parse_line_candidates(line)
                 if results:
@@ -49,11 +58,11 @@ def main():
         sys.exit(1)
 
     try:
-        with open(args.output, 'w', newline='') as f:
+        with open(args.output, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter=';')
             writer.writerow(['TARGET', 'User', 'Password'])
             for target, user, password in parsed:
-                writer.writerow([target, user, password])
+                writer.writerow([csv_safe(target), csv_safe(user), csv_safe(password)])
     except Exception as e:
         print(f"[ERROR] Failed to write CSV: {e}", file=sys.stderr)
         sys.exit(1)

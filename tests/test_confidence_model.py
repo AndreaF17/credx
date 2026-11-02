@@ -169,7 +169,6 @@ class ScorerIntegrationTests(unittest.TestCase):
             contents,
             {'name': 'leakA'},
             mode='balanced',
-            target=self.target,
             target_context=self.ctx,
             person_context=None,
             seen=seen,

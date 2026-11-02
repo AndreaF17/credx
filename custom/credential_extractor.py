@@ -219,6 +219,13 @@ def _derive_person_name_variants(email, person_name=None, include_local_from_ema
     return variants
 
 
+def has_dotted_tld(target):
+    """True when ``target`` has a dotted alphabetic TLD (``corp.com``), as opposed
+    to a bare single token (``acme``) or a person name."""
+    value = normalize_obfuscations(target.strip()).lstrip('@')
+    return bool(_HOST_TLD_PATTERN.search(value))
+
+
 def looks_like_domain(target):
     """True when ``target`` looks like a domain (or @domain), not a person name.
 

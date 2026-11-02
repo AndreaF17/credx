@@ -23,6 +23,7 @@ dependencies = [
     "colorlog",
     "python-dateutil>=2.8",
     "python-dotenv",
+    "tqdm",
 ]
 
 [project.urls]

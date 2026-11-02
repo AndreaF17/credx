@@ -37,7 +37,7 @@ echo "INTELX_API_KEY=your_key_here" > .env
 credx -t example.com
 ```
 
-That writes deduplicated credentials to `example.com-creds.txt` and prints a color-coded run summary.
+That writes deduplicated credentials to `out/example.com-creds.txt` and prints a color-coded run summary. (All output goes into the `out/` directory.)
 
 ---
 
@@ -109,7 +109,7 @@ A target with a space (e.g. `"John Doe"`), or any non-email target combined with
 ## Usage
 
 ```bash
-# Basic domain scan  ->  example.com-creds.txt
+# Basic domain scan  ->  out/example.com-creds.txt
 credx -t example.com
 
 # Scan a specific person's email (auto-enables person-email mode)
@@ -128,8 +128,8 @@ credx -t example.com -f csv
 # Interactive HTML report (searchable table, masked passwords with reveal)
 credx -t example.com -f html
 
-# Wider net: 12 months back, up to 500 results
-credx -t example.com -r 12 -m 500
+# Deeper history: 5 years back, up to 1000 results (default is 24 months / 500)
+credx -t example.com -r 60 -m 1000
 
 # Precision vs. recall
 credx -t example.com --mode strict        # fewer false positives
@@ -291,7 +291,7 @@ credx -t example.com   # continues where it left off
 Ensure `.env` exists with `INTELX_API_KEY=...` in your current directory, or pass `-k`.
 
 **No credentials found**
-Try `-e` to broaden the search, widen the range with `-r 12`, add `-d` to see what's being searched, or confirm the target exists in IntelX.
+Try `-e` to broaden the search, widen the range with `-r 60`, add `-d` to see what's being searched, or confirm the target exists in IntelX.
 
 **Rate-limit errors**
 credx retries with exponential backoff automatically. Lower `-m`, raise `--delay`, reduce `--workers`, or spread searches over time.

@@ -170,13 +170,22 @@ class ConfidenceModel:
         if not os.path.exists(target):
             return None
         try:
-            with open(target, 'r') as f:
+            with open(target, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if data.get('feature_names') != FEATURE_NAMES:
                 # Feature schema drift — refuse rather than score with a stale layout.
                 return None
+            dim = len(FEATURE_NAMES)
+            # Validate array shapes and the scaler before trusting the model, so a
+            # malformed file falls back to the heuristic instead of raising
+            # (IndexError / ZeroDivisionError) mid-scan.
+            if any(len(data.get(k, [])) != dim for k in ('weights', 'mean', 'std')):
+                return None
+            if any(float(s) == 0.0 for s in data['std']):
+                return None
+            float(data['bias'])  # must be numeric
             return cls(LogisticRegression.from_dict(data))
-        except (json.JSONDecodeError, ValueError, KeyError, OSError):
+        except (json.JSONDecodeError, ValueError, KeyError, OSError, TypeError):
             return None
 
     def score(self, candidate: Dict[str, Any], raw_line: Optional[str] = None) -> float:
