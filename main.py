@@ -202,6 +202,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
+# ── Terminal colors ───────────────────────────────────────────────────────────
+_ANSI = {
+    'reset': '\033[0m', 'bold': '\033[1m', 'dim': '\033[2m',
+    'red': '\033[31m', 'green': '\033[32m', 'yellow': '\033[33m',
+    'blue': '\033[34m', 'magenta': '\033[35m', 'cyan': '\033[36m',
+}
+
+
+def color_enabled(stream: Any = None) -> bool:
+    """Whether ANSI colors should be emitted.
+
+    Honors ``NO_COLOR`` (disable) and ``FORCE_COLOR`` (enable) env vars, and
+    otherwise only colors when writing to an interactive terminal.
+    """
+    stream = stream or sys.stderr
+    if os.environ.get('NO_COLOR'):
+        return False
+    if os.environ.get('FORCE_COLOR'):
+        return True
+    return bool(getattr(stream, 'isatty', lambda: False)())
+
+
+def colorize(text: Any, *styles: str, stream: Any = None) -> str:
+    """Wrap ``text`` in ANSI style codes, unless color is disabled."""
+    text = str(text)
+    if not styles or not color_enabled(stream):
+        return text
+    prefix = ''.join(_ANSI[s] for s in styles if s in _ANSI)
+    return f"{prefix}{text}{_ANSI['reset']}" if prefix else text
+
+
 def configure_logging(debug: bool) -> logging.Logger:
     """Configure and return the colored module logger."""
     log_level = logging.DEBUG if debug else logging.INFO
@@ -1208,12 +1239,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         scorer=scorer,
     )
 
+    written = 0
     try:
         if not new_creds:
-            log.info("No new credentials found")
+            log.info(colorize("No new credentials found", 'yellow'))
         else:
             written = write_output(new_creds, output_file, args.format, log)
-            log.info(f"Wrote {written} new credentials to: {output_file}")
+            log.info(
+                f"Wrote {colorize(written, 'bold', 'green')} new credentials to: "
+                f"{colorize(output_file, 'cyan')}"
+            )
     except OSError as e:
         log.error(f"Cannot create/write to output file {output_file}: {e}")
         return 1
@@ -1233,15 +1268,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         except (OSError, ValueError, json.JSONDecodeError, csv.Error) as e:
             log.error(f"Failed to create safe-share output: {e}")
 
-    log.info(f"Total unique credentials (all runs): {len(seen)}")
-    log.info(
-        "Extraction stats (%(mode)s) - scanned: %(lines_scanned)s, candidates: %(candidates_extracted)s, "
-        "pattern_skips: %(pattern_skips)s, low_conf: %(low_confidence_skips)s, "
-        "target_skips: %(target_skips)s, multi_lines: %(multi_candidate_lines)s, "
-        "duplicates: %(duplicates)s, new: %(new_credentials)s",
-        {**stats, 'mode': args.mode},
-    )
+    print_run_summary(target, written, len(seen), args.mode, stats)
     return 0
+
+
+def print_run_summary(
+    target: str,
+    written: int,
+    total_unique: int,
+    mode: str,
+    stats: Dict[str, Any],
+) -> None:
+    """Print a compact, color-coded end-of-run summary to stderr."""
+    bar = colorize('─' * 52, 'dim')
+    header = colorize(' credx — run summary ', 'bold', 'magenta')
+    new_color = 'green' if written else 'yellow'
+
+    def row(label: str, value: str) -> str:
+        return f"  {colorize(label.ljust(24), 'bold')}  {value}"
+
+    lines = [
+        '',
+        bar,
+        header,
+        bar,
+        row('Target', colorize(target, 'cyan')),
+        row('New this run', colorize(written, 'bold', new_color)),
+        row('Total unique (all runs)', colorize(total_unique, 'bold', 'green')),
+        bar,
+        f"  {colorize('Extraction (' + mode + ')', 'dim')}",
+        f"    scanned {colorize(stats['lines_scanned'], 'cyan')}  "
+        f"candidates {colorize(stats['candidates_extracted'], 'cyan')}  "
+        f"duplicates {colorize(stats['duplicates'], 'yellow')}",
+        f"    skipped — pattern {colorize(stats['pattern_skips'], 'yellow')}  "
+        f"low-conf {colorize(stats['low_confidence_skips'], 'yellow')}  "
+        f"off-target {colorize(stats['target_skips'], 'yellow')}",
+        bar,
+        '',
+    ]
+    print('\n'.join(lines), file=sys.stderr)
 
 
 if __name__ == '__main__':

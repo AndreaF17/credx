@@ -1,3 +1,4 @@
+import contextlib
 import csv
 import json
 import logging
@@ -568,6 +569,48 @@ class CsvDateColumnTests(unittest.TestCase):
             rows = list(csv.DictReader(f))
         self.assertIn('date', rows[0])
         self.assertEqual(rows[0]['date'], '2024-05-01')
+
+
+class ColorHelperTests(unittest.TestCase):
+    def setUp(self):
+        for var in ('NO_COLOR', 'FORCE_COLOR'):
+            self.addCleanup(os.environ.pop, var, None)
+            os.environ.pop(var, None)
+
+    def test_no_color_env_disables_codes(self):
+        os.environ['NO_COLOR'] = '1'
+        self.assertEqual(main.colorize('hi', 'green'), 'hi')
+
+    def test_force_color_env_enables_codes(self):
+        os.environ['FORCE_COLOR'] = '1'
+        out = main.colorize('hi', 'green')
+        self.assertTrue(out.startswith('\033['))
+        self.assertTrue(out.endswith(main._ANSI['reset']))
+        self.assertIn('hi', out)
+
+    def test_no_styles_returns_plain_text(self):
+        os.environ['FORCE_COLOR'] = '1'
+        self.assertEqual(main.colorize('hi'), 'hi')
+
+    def test_non_tty_stream_is_not_colored(self):
+        import io
+        self.assertFalse(main.color_enabled(io.StringIO()))
+
+    def test_print_run_summary_renders_all_values(self):
+        import io
+        os.environ['NO_COLOR'] = '1'
+        stats = {
+            'lines_scanned': 10, 'candidates_extracted': 4, 'pattern_skips': 1,
+            'low_confidence_skips': 2, 'target_skips': 0, 'multi_candidate_lines': 0,
+            'duplicates': 3, 'new_credentials': 1,
+        }
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            main.print_run_summary('example.com', 1, 42, 'balanced', stats)
+        out = buf.getvalue()
+        self.assertIn('example.com', out)
+        self.assertIn('42', out)
+        self.assertIn('balanced', out)
 
 
 if __name__ == '__main__':
