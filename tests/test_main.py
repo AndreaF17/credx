@@ -651,16 +651,36 @@ class HtmlOutputTests(unittest.TestCase):
         self.assertIn('a@corp.com:p1', seen)
 
     def test_script_payload_is_injection_safe(self):
-        n = main.write_html_output([self._cred('a@corp.com', 'pw</script><b>x')], self.path, self.log)
+        evil = "pw</script><!--&<img src=x onerror=alert(1)>'\""
+        n = main.write_html_output([self._cred('a@corp.com', evil)], self.path, self.log)
         self.assertEqual(n, 1)
         with open(self.path) as f:
             html = f.read()
-        # The raw closing tag must not appear inside the embedded data block.
-        data_block = html.split('id="credx-data"', 1)[1].split('</script>', 1)[0]
-        self.assertNotIn('</script', data_block)
+        # No raw <, > or & may appear in the embedded JSON payload: that's what
+        # prevents </script>, <!-- or entity tricks from breaking out.
+        payload = main._HTML_DATA_RE.search(html).group(1)
+        for ch in ('<', '>', '&'):
+            self.assertNotIn(ch, payload)
         # …but the value round-trips intact.
         recs = main._load_html_records(self.path, self.log)
-        self.assertEqual(recs[0]['password'], 'pw</script><b>x')
+        self.assertEqual(recs[0]['password'], evil)
+
+    def test_client_escaper_handles_single_quote(self):
+        # The data-pw attribute is single-quoted, so esc() must escape ' too,
+        # or an injected value could break out of the attribute (stored XSS).
+        main.write_html_output([self._cred('a@corp.com', "x' onmouseover='alert(1)")], self.path, self.log)
+        with open(self.path) as f:
+            html = f.read()
+        self.assertIn("replace(/'/g", html)  # esc() covers the single quote
+
+    def test_safe_share_reads_html_format(self):
+        main.write_html_output(
+            [self._cred('a@corp.com', 'SuperSecret1')], self.path, self.log,
+        )
+        rows = list(main.iter_credentials_for_safe_share(self.path, 'html'))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['identity'], 'a@corp.com')
+        self.assertEqual(rows[0]['password'], 'SuperSecret1')
 
 
 if __name__ == '__main__':

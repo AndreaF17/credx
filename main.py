@@ -347,6 +347,16 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                     'date': row.get('date', ''),
                 }
 
+    elif output_format == 'html':
+        for entry in _load_html_records(main_output_path, logging.getLogger('intelx_scanner')):
+            yield {
+                'url': entry.get('url', ''),
+                'identity': entry.get('identity') or entry.get('email', ''),
+                'password': entry.get('password', ''),
+                'source': entry.get('source', ''),
+                'date': entry.get('date', ''),
+            }
+
     else:  # txt
         with open(main_output_path, 'r') as f:
             for line in f:
@@ -1258,7 +1268,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   function esc(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
   function confClass(c) {
     c = Number(c) || 0;
@@ -1336,7 +1346,8 @@ def _load_html_records(output_file: str, log: logging.Logger) -> List[Dict[str, 
             match = _HTML_DATA_RE.search(f.read())
         if not match:
             return []
-        data = json.loads(match.group(1).replace('<\\/', '</'))
+        # The embedded payload escapes <, >, & as \uXXXX; json.loads decodes them.
+        data = json.loads(match.group(1))
         return data if isinstance(data, list) else []
     except (OSError, ValueError) as e:
         log.warning(f"Could not parse existing HTML report ({e}); starting fresh")
@@ -1346,7 +1357,15 @@ def _load_html_records(output_file: str, log: logging.Logger) -> List[Dict[str, 
 def _render_html_report(records: List[Dict[str, Any]]) -> str:
     """Render a self-contained, interactive HTML credential report."""
     generated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    payload = json.dumps(records, ensure_ascii=False).replace('</', '<\\/')
+    # Escape every <, > and & as \uXXXX so the JSON can never break out of the
+    # <script> data block (e.g. a leaked value containing "</script>" or "<!--").
+    # JSON.parse (browser) and json.loads (resume) both decode these back.
+    payload = (
+        json.dumps(records, ensure_ascii=False)
+        .replace('<', '\\u003c')
+        .replace('>', '\\u003e')
+        .replace('&', '\\u0026')
+    )
     return (
         _HTML_TEMPLATE
         .replace('__TITLE__', html_lib.escape('credx — credential report'))
