@@ -31,7 +31,7 @@ in an isolated environment:
 pipx install .
 
 # Or directly from GitHub
-pipx install git+https://github.com/AndreaF17/IntelX-Credential-Scanner.git
+pipx install git+https://github.com/AndreaF17/credx.git
 ```
 
 This installs two commands: `credx` (the scanner) and `credx-train` (the optional
@@ -40,8 +40,8 @@ confidence-model trainer).
 ### From source (for development)
 
 ```bash
-git clone https://github.com/AndreaF17/IntelX-Credential-Scanner.git
-cd IntelX-Credential-Scanner
+git clone https://github.com/AndreaF17/credx.git
+cd credx
 
 python3 -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate

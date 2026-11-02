@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/AndreaF17/IntelX-Credential-Scanner"
-Repository = "https://github.com/AndreaF17/IntelX-Credential-Scanner"
+Homepage = "https://github.com/AndreaF17/credx"
+Repository = "https://github.com/AndreaF17/credx"
 
 [project.scripts]
 credx = "main:main"
