@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import re
 import unicodedata
 from urllib.parse import urlparse
@@ -96,6 +97,55 @@ def _looks_like_locator(value):
     """True when ``value`` is a hostname/URL or IPv4 address (a network locator)."""
     value = sanitize_value(value)
     return _is_plausible_host(value) or bool(_IPV4_PATTERN.match(value))
+
+
+# ── Password-hash detection ────────────────────────────────────────────────────
+# Many dumps store hashed passwords, not plaintext. Tagging the hash type lets an
+# operator pick the right cracking mode and tells a reader "this is a digest, not
+# a usable password". Detection is conservative: a value is only called a hash when
+# its shape is unambiguous (a known crypt prefix, or pure hex of an exact digest
+# length), so strong random plaintext passwords are not mislabeled.
+
+# Plain unsalted hex digests, keyed by hex length. 32 hex is reported as md5; NTLM
+# shares that length and is indistinguishable from the value alone.
+_HEX_HASH_BY_LEN = {
+    32: 'md5', 40: 'sha1', 56: 'sha224', 64: 'sha256', 96: 'sha384', 128: 'sha512',
+}
+_HEX_ONLY_PATTERN = re.compile(r'^[0-9a-fA-F]+$')
+# bcrypt: $2a$/$2b$/$2x$/$2y$, two-digit cost, then 53 chars of salt+digest.
+_BCRYPT_PATTERN = re.compile(r'^\$2[abxy]\$[0-9]{2}\$[./A-Za-z0-9]{53}$')
+# Argon2 (i/d/id) and phpass/WordPress ($P$ / $H$) portable hashes.
+_ARGON2_PATTERN = re.compile(r'^\$argon2(?:id|i|d)\$')
+_PHPASS_PATTERN = re.compile(r'^\$[PH]\$[./A-Za-z0-9]{30,}$')
+# Unix crypt() families identified by their numeric id prefix.
+_CRYPT_PREFIXES = (
+    ('$1$', 'md5crypt'),
+    ('$5$', 'sha256crypt'),
+    ('$6$', 'sha512crypt'),
+)
+
+
+def classify_secret(value):
+    """Return the hash type of ``value`` (``md5``, ``bcrypt``, …) or ``plaintext``.
+
+    Only unambiguous shapes are classified as hashes; anything else is treated as
+    a plaintext password so real credentials are never hidden behind a wrong tag.
+    """
+    candidate = (value or '').strip()
+    if not candidate:
+        return 'plaintext'
+    if _BCRYPT_PATTERN.match(candidate):
+        return 'bcrypt'
+    if _ARGON2_PATTERN.match(candidate):
+        return 'argon2'
+    if _PHPASS_PATTERN.match(candidate):
+        return 'phpass'
+    for prefix, name in _CRYPT_PREFIXES:
+        if candidate.startswith(prefix):
+            return name
+    if len(candidate) in _HEX_HASH_BY_LEN and _HEX_ONLY_PATTERN.match(candidate):
+        return _HEX_HASH_BY_LEN[len(candidate)]
+    return 'plaintext'
 
 
 def _add_unique(target_list, seen, value):
@@ -440,6 +490,9 @@ def calculate_confidence(identity, password, url_part, pattern):
         'url_delimited': 0.94,
         'host_delimited': 0.88,
         'email_delimited': 0.86,
+        # Structured dumps are explicitly keyed, so an extracted pair is high-signal.
+        'sql_insert': 0.90,
+        'json_object': 0.88,
         'kv_pairs': 0.78,
         'window_triplet': 0.62,
     }.get(pattern, 0.55)
@@ -562,6 +615,7 @@ def _build_candidate(candidates, seen, identity, password, url_part, pattern, ra
         'canonical': canonical,
         'dedup_key': dedup_key,
         'raw_line': raw_line,
+        'secret_type': classify_secret(password),
     })
 
 
@@ -643,6 +697,220 @@ def _extract_from_inline_patterns(chunk, candidates, seen):
         _build_candidate(candidates, seen, match.group(1), match.group(2), prefix, 'email_delimited', chunk)
 
 
+# ── Structured-dump parsing ─────────────────────────────────────────────────────
+# Line-based delimiter parsing misses the structured formats breaches ship in: SQL
+# dumps and JSON/NDJSON exports. These parsers run on the whole raw line (never the
+# whitespace-split chunks, which would shatter a JSON object or a SQL value tuple)
+# and route every pair through _build_candidate, so they inherit the same
+# false-positive filters, confidence scoring, hash tagging and dedup. Both name the
+# credential columns explicitly, so the password column is known — unlike a
+# header-less CSV row, where "the field next to the email" is as likely to be a
+# name, role or employee-id as a password, so that is deliberately not parsed here.
+
+# Column / JSON-key name groups, in priority order (most specific first).
+# `*_EXACT` keys match a whole column name; `*_TOKEN` keys also match when they are
+# a word inside a compound name (password_hash, emailAddress). Token keys are kept
+# long and unambiguous so short fragments can't hijack an unrelated column
+# ('pass' must not match 'passport', 'hash' must not match 'avatar_hash').
+_FIELD_IDENTITY_EXACT = (
+    'email', 'e_mail', 'emailaddress', 'email_address', 'mail',
+    'username', 'user_name', 'login', 'login_name', 'user', 'account', 'uid', 'userid',
+)
+_FIELD_IDENTITY_TOKEN = ('email', 'username', 'login')
+_FIELD_PASSWORD_EXACT = (
+    'password', 'passwd', 'password_hash', 'password_digest', 'passworddigest',
+    'pass_hash', 'passhash', 'pwdhash', 'pwd_hash', 'pwd', 'pass', 'hash',
+)
+# 'pwd'/'pass' are safe as TOKEN keys (token matching is word-exact, so 'pass'
+# matches a 'user_pass' column but never 'passport', which is a single token).
+_FIELD_PASSWORD_TOKEN = ('password', 'passwd', 'pwd', 'pass')
+_FIELD_URL_EXACT = ('url', 'uri', 'website', 'site', 'hostname', 'host', 'domain', 'origin')
+_FIELD_URL_TOKEN = ('url', 'uri', 'website', 'hostname')
+# Tokens that mark a compound column as *not* the live value even when it also
+# carries a credential token: non-secret auth artifacts (reset_password_token,
+# security_answer, email_verified) and metadata/counter/timestamp columns
+# (login_count, password_attempts, password_changed_at, last_login).
+_FIELD_SKIP_TOKENS = frozenset({
+    'token', 'reset', 'salt', 'hint', 'question', 'answer', 'confirm',
+    'verify', 'verified', 'recovery', 'otp',
+    'count', 'attempts', 'attempt', 'failed', 'history', 'expiry', 'expires',
+    'expiration', 'expired', 'created', 'updated', 'modified', 'changed',
+    'date', 'time', 'at', 'last', 'first', 'status', 'flag', 'level',
+    'number', 'num', 'total',
+})
+# Identity columns additionally reject network/metadata tokens that are never a
+# username (login_ip, email_domain, account_id).
+_IDENTITY_SKIP_TOKENS = _FIELD_SKIP_TOKENS | frozenset({'ip', 'domain', 'id'})
+_CAMEL_BOUNDARY_RE = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
+
+_SQL_INSERT_RE = re.compile(
+    r'INSERT\s+INTO\s+\S+\s*\(([^)]*)\)\s*VALUES\s*(.+)',
+    re.IGNORECASE | re.DOTALL,
+)
+# Stop after a sane number of value tuples so a pathological single-line dump
+# (one giant multi-row INSERT) can't tie up a worker.
+_SQL_MAX_TUPLES = 5000
+
+
+def _field_tokens(name):
+    """Split a column/key name into lowercase word tokens (snake_case + camelCase)."""
+    snake = _CAMEL_BOUNDARY_RE.sub('_', name)
+    return {token for token in re.split(r'[^A-Za-z0-9]+', snake.lower()) if token}
+
+
+def _field_usable(value):
+    """True when ``value`` is a real scalar worth using (not null/bool/placeholder/empty)."""
+    if value is None or isinstance(value, (bool, dict, list)):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() not in _PLACEHOLDER_VALUES
+
+
+def _pick_field(pairs, exact_keys, token_keys, skip_tokens=_FIELD_SKIP_TOKENS):
+    """Return the first usable value whose column/key matches ``keys``.
+
+    Exact whole-name match takes priority (honoring key order); then a token match
+    for the unambiguous ``token_keys``, skipping columns that carry a
+    not-the-value marker token (``skip_tokens``). Null/empty/placeholder values are
+    skipped so the search falls through to the next matching key (password=null ->
+    pwd; login_count -> the real login column).
+    """
+    prepared = [(name.lower(), _field_tokens(name), value) for name, value in pairs]
+    for key in exact_keys:
+        for lname, _tokens, value in prepared:
+            if lname == key and _field_usable(value):
+                return value
+    for key in token_keys:
+        for _lname, tokens, value in prepared:
+            if key in tokens and not (tokens & skip_tokens) and _field_usable(value):
+                return value
+    return ''
+
+
+def _clean_sql_ident(col):
+    """Normalize a SQL column name: drop quoting/backticks/brackets, lowercase."""
+    return col.strip().strip('`"\'[]').strip().lower()
+
+
+def _split_sql_tuples(blob):
+    """Split a SQL ``VALUES`` blob into a list of field lists.
+
+    Quote-aware (single/double), honoring ``''`` and ``\\'`` escapes, so commas and
+    parens inside string literals do not split a field or end a tuple early.
+    """
+    tuples = []
+    i, n = 0, len(blob)
+    while i < n and len(tuples) < _SQL_MAX_TUPLES:
+        if blob[i] != '(':
+            i += 1
+            continue
+        fields, buf = [], []
+        quoted = False
+        in_quote = None
+        closed = False
+        j = i + 1
+        while j < n:
+            ch = blob[j]
+            if in_quote is not None:
+                if ch == '\\' and j + 1 < n:
+                    buf.append(blob[j + 1])
+                    j += 2
+                    continue
+                if ch == in_quote:
+                    if j + 1 < n and blob[j + 1] == in_quote:  # '' -> literal quote
+                        buf.append(in_quote)
+                        j += 2
+                        continue
+                    in_quote = None
+                    j += 1
+                    continue
+                buf.append(ch)
+                j += 1
+                continue
+            if ch in ("'", '"'):
+                in_quote = ch
+                quoted = True
+                j += 1
+                continue
+            if ch == ',':
+                fields.append(''.join(buf) if quoted else ''.join(buf).strip())
+                buf, quoted = [], False
+                j += 1
+                continue
+            if ch == ')':
+                fields.append(''.join(buf) if quoted else ''.join(buf).strip())
+                closed = True
+                j += 1
+                break
+            buf.append(ch)
+            j += 1
+        if closed and fields:
+            tuples.append(fields)
+            i = j
+        else:
+            break  # unbalanced parens: stop rather than rescan
+    return tuples
+
+
+def _extract_from_sql_insert(line, candidates, seen, mode):
+    """Extract creds from a SQL INSERT. Returns True if the line IS such a statement
+    (so the caller skips the delimiter parsers that would only shred it), even when
+    no credential column was present."""
+    match = _SQL_INSERT_RE.search(line)
+    if not match:
+        return False
+    cols = [_clean_sql_ident(c) for c in match.group(1).split(',')]
+    if not any(cols):
+        return False  # INSERT ... VALUES without a usable column list: let legacy try
+    for values in _split_sql_tuples(match.group(2)):
+        pairs = list(zip(cols, values))
+        identity = _pick_field(pairs, _FIELD_IDENTITY_EXACT, _FIELD_IDENTITY_TOKEN, _IDENTITY_SKIP_TOKENS)
+        password = _pick_field(pairs, _FIELD_PASSWORD_EXACT, _FIELD_PASSWORD_TOKEN)
+        url_part = _pick_field(pairs, _FIELD_URL_EXACT, _FIELD_URL_TOKEN)
+        if identity and password:
+            _build_candidate(candidates, seen, identity, password, url_part, 'sql_insert', line)
+    return True
+
+
+def _json_scalar(value):
+    """Return a JSON value as a trimmed string, or '' for bools/null/containers."""
+    if isinstance(value, bool):
+        return ''
+    if isinstance(value, (str, int, float)):
+        return str(value).strip()
+    return ''
+
+
+def _extract_from_json_object(line, candidates, seen, mode):
+    """Extract creds from a JSON object / array-of-objects line. Returns True if the
+    line IS such JSON (so the caller skips the delimiter parsers that would only
+    shred it), even when no credential key was present. A JSON array of plain
+    strings is NOT treated as structured — it may be a combolist the delimiter
+    parsers should handle."""
+    stripped = line.strip()
+    if not stripped or stripped[0] not in '{[':
+        return False
+    try:
+        data = json.loads(stripped)
+    except (ValueError, TypeError):
+        return False
+    objects = data if isinstance(data, list) else [data]
+    saw_object = False
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        saw_object = True
+        pairs = [(str(k), v) for k, v in obj.items()]
+        identity = _json_scalar(_pick_field(pairs, _FIELD_IDENTITY_EXACT, _FIELD_IDENTITY_TOKEN, _IDENTITY_SKIP_TOKENS))
+        password = _json_scalar(_pick_field(pairs, _FIELD_PASSWORD_EXACT, _FIELD_PASSWORD_TOKEN))
+        url_part = _json_scalar(_pick_field(pairs, _FIELD_URL_EXACT, _FIELD_URL_TOKEN))
+        if identity and password:
+            _build_candidate(candidates, seen, identity, password, url_part, 'json_object', line)
+    return saw_object
+
+
 def _split_chunks(line):
     chunks = [line]
     for splitter in [r'\s*\|\|\s*', r'\s+\|\s+', r'\s*&&\s*', r'\s{2,}']:
@@ -670,14 +938,23 @@ def extract_credentials_from_line(line, mode=DEFAULT_MODE):
     candidates = []
     seen = set()
 
-    chunks = _split_chunks(normalized_line)
-    if raw_line not in chunks:
-        chunks.append(raw_line)
+    # Structured formats (keyed, so the password column is unambiguous) parse the
+    # whole raw line first. A recognized SQL/JSON line is authoritative — the
+    # delimiter parsers below would only shred its punctuation into noise — so they
+    # are skipped whenever the line IS structured, even if it yielded no credential
+    # (e.g. a JSON row whose password is null, or a non-credential table).
+    structured = _extract_from_sql_insert(raw_line, candidates, seen, mode)
+    structured = _extract_from_json_object(raw_line, candidates, seen, mode) or structured
 
-    for chunk in chunks:
-        _extract_from_inline_patterns(chunk, candidates, seen)
-        _extract_from_kv_pairs(chunk, candidates, seen, mode)
-        _extract_from_triplet_windows(chunk, candidates, seen, mode)
+    if not structured:
+        chunks = _split_chunks(normalized_line)
+        if raw_line not in chunks:
+            chunks.append(raw_line)
+
+        for chunk in chunks:
+            _extract_from_inline_patterns(chunk, candidates, seen)
+            _extract_from_kv_pairs(chunk, candidates, seen, mode)
+            _extract_from_triplet_windows(chunk, candidates, seen, mode)
 
     mode_config = _mode_config(mode)
     if not mode_config['allow_identity_without_url']:

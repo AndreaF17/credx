@@ -139,6 +139,10 @@ credx -t example.com --mode aggressive    # more hits on noisy dumps
 credx -t example.com --company-wide       # also sweep the bare domain
 credx -t example.com --expand-archives    # open multi-file leaks/archives
 credx -t example.com --phonebook          # enumerate leaked emails
+credx -t example.com --phonebook-search   # then hunt creds for each discovered email (big recall boost)
+
+# Search deeper: results are paginated automatically — just raise -m
+credx -t example.com -m 2000
 
 # Share results with a client, anonymized
 credx -t example.com --safe-share
@@ -168,6 +172,8 @@ credx -t example.com --workers 4 --delay 0.5
 | `--company-wide` | | off | For a domain target, also search the bare domain (catches `domain:user:pass`) |
 | `--expand-archives` | | off | Walk multi-file leaks (archives/folders) and fetch each child file |
 | `--phonebook` | | off | Enumerate leaked selectors to `out/<target>-emails.txt` |
+| `--phonebook-search` | | off | Hunt credentials for each discovered email on the target domain (implies `--phonebook`). Big recall boost, many extra API calls |
+| `--phonebook-max` | `N` | `0` | Cap how many discovered emails `--phonebook-search` hunts (`0` = no cap) |
 | `--person-name` | `"Full Name"` | | Enrich person-email search terms |
 | `--safe-share` | | off | Also write a sanitized CSV safe to share externally |
 | `--safe-output` | `FILE` | `out/<output>-safe.csv` | Safe-share output path |
@@ -233,6 +239,7 @@ portal.example.com:admin:SecurePass456
     "identity": "user@example.com",
     "email": "user@example.com",
     "password": "Password123!",
+    "secret_type": "plaintext",
     "confidence": 0.97,
     "pattern": "url_delimited",
     "source": "breach_2024_leak.txt"
@@ -240,22 +247,24 @@ portal.example.com:admin:SecurePass456
 ]
 ```
 
+`secret_type` is `plaintext` or the detected hash type (`md5`, `sha1`, `sha256`, `sha512`, `bcrypt`, `argon2`, `md5crypt`, `sha256crypt`, `sha512crypt`, `phpass`).
+
 **CSV** — same fields as columns:
 ```csv
-url,identity,email,password,source,confidence,pattern,...
-https://app.example.com,user@example.com,user@example.com,Password123!,breach_2024_leak.txt,0.97,url_delimited,...
+url,identity,email,password,secret_type,date,source,confidence,pattern,...
+https://app.example.com,user@example.com,user@example.com,Password123!,plaintext,2024-05-01,breach_2024_leak.txt,0.97,url_delimited,...
 ```
 
 **HTML** (`-f html`) — a self-contained, interactive report (`out/<target>-creds.html`):
 
-- Searchable, sortable table of every credential
+- Searchable, sortable table of every credential, with a **Type** column (plaintext vs. hash)
 - Passwords **masked by default**; click a password or toggle **Reveal passwords** to show them
 - Confidence color-coding, light/dark theme, no external dependencies — just open it in a browser
 - Resumable like JSON/CSV: records are embedded in the page, so re-runs accumulate and dedup
 
 ### Safe-share export
 
-`--safe-share` produces an anonymized CSV (`TARGET`, `User`, masked `Password`, `Source`) intended for sharing with clients. Customize the path with `--safe-output <file>`.
+`--safe-share` produces an anonymized CSV (`TARGET`, `User`, masked `Password`, `Type`, `Date`, `Source`) intended for sharing with clients — the `Type` column flags whether each masked secret was plaintext or a hash. Customize the path with `--safe-output <file>`.
 
 ---
 
@@ -272,13 +281,16 @@ credx -t example.com   # continues where it left off
 
 ## Features
 
-- **Multi-bucket search** across `leaks.private`, `leaks.public`, `leaks.private.li`, and `pastes`
+- **Multi-bucket search** across `leaks.private`, `leaks.public`, `leaks.private.li`, and `pastes`, paginated automatically up to `-m`
 - **Smart deduplication** across all sources, with resume support
 - **Flexible extraction** — handles `:`, `;`, `|`, and key/value dumps, plus multiple credentials per line
+- **Structured-dump parsing** — reads SQL `INSERT` statements and JSON/NDJSON exports (where the credential columns are named), not just delimited combolists
+- **Password-hash detection** — tags each secret as plaintext or a hash type (MD5, SHA-1/256/512, bcrypt, argon2, md5crypt…), so you know what you're cracking
 - **False-positive filtering** with confidence scoring on every match
 - **Optional ML scorer** (stdlib logistic regression) for the cases the heuristic over-trusts
 - **Domain, email, and person-name targeting** — hunt a person by name, anchored to their company domain
-- **Interactive HTML report** with masked passwords, search, and sorting
+- **Phonebook-driven recall** — enumerate a domain's leaked emails, then hunt credentials for each (`--phonebook-search`)
+- **Interactive HTML report** with masked passwords, a hash-type column, search, and sorting
 - **Safe-share export** for anonymized client reports
 - **Concurrent fetching** (`--workers`) with built-in rate limiting and exponential-backoff retries
 - **Color-coded output** and a readable end-of-run summary (`NO_COLOR` / `FORCE_COLOR` aware)
@@ -291,7 +303,7 @@ credx -t example.com   # continues where it left off
 Ensure `.env` exists with `INTELX_API_KEY=...` in your current directory, or pass `-k`.
 
 **No credentials found**
-Try `-e` to broaden the search, widen the range with `-r 60`, add `-d` to see what's being searched, or confirm the target exists in IntelX.
+Try `-e` to broaden the search, widen the range with `-r 60`, raise `-m` to page deeper, add `--phonebook-search` to hunt every leaked email on the domain, add `-d` to see what's being searched, or confirm the target exists in IntelX.
 
 **Rate-limit errors**
 credx retries with exponential backoff automatically. Lower `-m`, raise `--delay`, reduce `--workers`, or spread searches over time.

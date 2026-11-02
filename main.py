@@ -157,6 +157,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              '(emails/domains) for the target, written to out/<target>-emails.txt.',
     )
     parser.add_argument(
+        '--phonebook-search', action='store_true',
+        help='After enumerating selectors, also hunt credentials for each discovered '
+             'email on the target domain (implies --phonebook). Big recall boost, but '
+             'many extra API searches. Needs a domain anchor (email/domain target, or '
+             '--domain for a person).',
+    )
+    parser.add_argument(
+        '--phonebook-max', type=int, default=0,
+        help='Cap how many discovered emails --phonebook-search hunts (0 = no cap, '
+             'the default). Rate limiting still applies via --delay/--workers.',
+    )
+    parser.add_argument(
         '--person-name',
         type=str,
         default=None,
@@ -222,6 +234,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if args.safe_output and not args.safe_share:
         args.safe_share = True
 
+    # --phonebook-search needs the enumeration step to feed it.
+    if args.phonebook_search:
+        args.phonebook = True
+
     if args.workers < 1:
         parser.error('--workers must be >= 1')
     if args.delay < 0:
@@ -230,6 +246,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error('--range must be >= 1 (months)')
     if args.maxresults < 1:
         parser.error('--maxresults must be >= 1')
+    if args.phonebook_max < 0:
+        parser.error('--phonebook-max must be >= 0 (0 = no cap)')
 
     return args
 
@@ -359,6 +377,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                     'url': entry.get('url', ''),
                     'identity': entry.get('identity') or entry.get('email', ''),
                     'password': entry.get('password', ''),
+                    'secret_type': entry.get('secret_type', 'plaintext'),
                     'source': entry.get('source', ''),
                     'date': entry.get('date', ''),
                 }
@@ -371,6 +390,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                     'url': row.get('url', ''),
                     'identity': row.get('identity') or row.get('email', ''),
                     'password': row.get('password', ''),
+                    'secret_type': row.get('secret_type', 'plaintext'),
                     'source': row.get('source', ''),
                     'date': row.get('date', ''),
                 }
@@ -381,6 +401,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                 'url': entry.get('url', ''),
                 'identity': entry.get('identity') or entry.get('email', ''),
                 'password': entry.get('password', ''),
+                'secret_type': entry.get('secret_type', 'plaintext'),
                 'source': entry.get('source', ''),
                 'date': entry.get('date', ''),
             }
@@ -400,6 +421,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                         'url': target,
                         'identity': user,
                         'password': password,
+                        'secret_type': 'plaintext',
                         'source': '',
                         'date': date,
                     }
@@ -425,6 +447,7 @@ def write_safe_share_file(main_output_path: str, output_format: str, safe_output
             'TARGET': _csv_safe(cred.get('url', '')),
             'User': _csv_safe(identity),
             'Password': _csv_safe(anonymize_password(password)),
+            'Type': _csv_safe(cred.get('secret_type', 'plaintext')),
             'Date': _csv_safe(cred.get('date', '')),
             'Source': _csv_safe(cred.get('source', '')),
         })
@@ -433,7 +456,7 @@ def write_safe_share_file(main_output_path: str, output_format: str, safe_output
         return 0
 
     with _secure_open(safe_output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['TARGET', 'User', 'Password', 'Date', 'Source'], delimiter=';')
+        writer = csv.DictWriter(f, fieldnames=['TARGET', 'User', 'Password', 'Type', 'Date', 'Source'], delimiter=';')
         writer.writeheader()
         writer.writerows(safe_rows)
 
@@ -754,6 +777,102 @@ def write_phonebook_output(selectors: Iterable[str], output_path: str, log: logg
     return written
 
 
+def resolve_phonebook_domain(
+    target: str, domain_arg: Optional[str], is_person_name: bool = False
+) -> Optional[str]:
+    """Return the domain to anchor phonebook-discovered emails to, or None.
+
+    ``--domain`` only anchors a person-name target (for email/domain targets the
+    rest of the CLI ignores it and warns), so it is honored here only when
+    ``is_person_name``. Otherwise the target's own domain is used: an email
+    target's domain, or a domain target itself. A bare person-name target with no
+    ``--domain`` yields None — there is nothing to scope the enumerated addresses
+    to.
+    """
+    if is_person_name and domain_arg:
+        return domain_arg.strip().lstrip('@').lower() or None
+    target = (target or '').strip()
+    if is_email_target(target):
+        return target.rpartition('@')[2].lower() or None
+    if looks_like_domain(target):
+        return target.lstrip('@').lower() or None
+    return None
+
+
+def filter_emails_for_domain(selectors: Iterable[str], domain: str, cap: int = 0) -> List[str]:
+    """Keep discovered selectors that are emails on ``domain`` (or a subdomain).
+
+    Deduplicates case-insensitively while preserving first-seen order/casing, and
+    caps the count when ``cap > 0`` (``0`` means no cap).
+    """
+    domain = (domain or '').strip().lstrip('@').lower()
+    if not domain:
+        return []
+    suffix_exact = '@' + domain
+    suffix_sub = '.' + domain
+    out: List[str] = []
+    seen: Set[str] = set()
+    for selector in selectors:
+        email = (selector or '').strip()
+        lowered = email.lower()
+        if '@' not in lowered:
+            continue
+        if not (lowered.endswith(suffix_exact) or lowered.endswith(suffix_sub)):
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(email)
+        if cap and len(out) >= cap:
+            break
+    return out
+
+
+def _merge_results(
+    primary: List[Dict[str, Any]], extra: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Append ``extra`` leak records to ``primary``, deduplicating by storageid."""
+    seen = {r.get('storageid') for r in primary if isinstance(r, dict)}
+    for record in extra:
+        if not isinstance(record, dict):
+            continue
+        sid = record.get('storageid')
+        if sid not in seen:
+            seen.add(sid)
+            primary.append(record)
+    return primary
+
+
+def gather_phonebook_results(
+    ix: Any,
+    discovered: Iterable[str],
+    domain: str,
+    buckets: Iterable[str],
+    date_from: str,
+    date_to: str,
+    max_results: int,
+    cap: int,
+    log: logging.Logger,
+) -> List[Dict[str, Any]]:
+    """Search each phonebook-discovered email on ``domain`` and return leak records.
+
+    Returns an empty list (never raises) when there is nothing to search or every
+    follow-up search fails, so a failed second pass never discards primary results.
+    """
+    emails = filter_emails_for_domain(discovered, domain, cap)
+    if not emails:
+        log.info(f"Phonebook-search: no discovered addresses on '{domain}' to hunt")
+        return []
+    log.info(f"Phonebook-search: hunting {len(emails)} discovered address(es) on '{domain}'")
+    try:
+        return run_search(ix, emails, buckets, date_from, date_to, max_results, log)
+    except AllSearchesFailed as e:
+        log.warning(
+            f"Phonebook-search: every follow-up search failed ({e}); keeping primary results"
+        )
+        return []
+
+
 # ── Resume: load previously saved credentials ───────────────────────────────
 def load_existing_dedup(output_file: str, output_format: str, log: logging.Logger) -> Set[str]:
     """Load dedup keys from an existing output file so resumed runs skip them.
@@ -1014,6 +1133,7 @@ def _process_contents(
                 'identity': identity,
                 'email': email_value,
                 'password': candidate['password'],
+                'secret_type': candidate.get('secret_type', 'plaintext'),
                 'source': leak.get('name', 'unknown'),
                 'date': _leak_date(leak),
                 'raw_line': line_stripped,
@@ -1231,6 +1351,7 @@ CSV_FIELDNAMES = [
     'identity',
     'email',
     'password',
+    'secret_type',
     'date',
     'source',
     'confidence',
@@ -1357,6 +1478,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         <th data-k="url">URL</th>
         <th data-k="identity">Identity</th>
         <th data-k="password">Password</th>
+        <th data-k="secret_type">Type</th>
         <th data-k="confidence">Conf.</th>
         <th data-k="pattern">Pattern</th>
       </tr>
@@ -1396,7 +1518,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     var showAll = reveal.checked;
     var rows = data.filter(function (r) {
       if (!term) return true;
-      return [r.identity, r.email, r.url, r.password, r.source, r.pattern, r.date]
+      return [r.identity, r.email, r.url, r.password, r.secret_type, r.source, r.pattern, r.date]
         .some(function (v) { return String(v || "").toLowerCase().indexOf(term) !== -1; });
     });
     rows.sort(function (a, b) {
@@ -1415,6 +1537,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         "<td class='mono'>" + esc(r.url || "") + "</td>" +
         "<td class='mono'>" + esc(r.identity || r.email || "") + "</td>" +
         "<td class='pw' data-pw='" + pw + "' title='click to toggle'>" + shown + "</td>" +
+        "<td>" + esc(r.secret_type || "plaintext") + "</td>" +
         "<td><span class='pill " + confClass(r.confidence) + "'>" + conf + "</span></td>" +
         "<td>" + esc(r.pattern || "") + "</td>" +
         "</tr>";
@@ -1658,8 +1781,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.debug(f"IntelX API initialized for target: {target}")
         buckets = resolve_buckets(ix, log)
         results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
-        if args.expand_archives:
-            results = expand_container_leaks(ix, results, log)
     except AllSearchesFailed as e:
         log.error(str(e))
         return 2
@@ -1669,9 +1790,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     os.makedirs('out', exist_ok=True)
 
+    discovered: List[str] = []
     if args.phonebook:
         try:
-            discovered: List[str] = []
             discovered_seen: Set[str] = set()
             for term in search_terms:
                 for value in run_phonebook_search(
@@ -1684,6 +1805,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             write_phonebook_output(discovered, emails_path, log)
         except EXPECTED_LEAK_ERRORS as e:
             log.error(f"Phonebook discovery failed: {e}")
+
+    # Phonebook-search: feed domain-matching discovered emails back into the hunt.
+    if args.phonebook_search:
+        pb_domain = resolve_phonebook_domain(target, args.domain, is_person_name=target_is_person_name)
+        if pb_domain:
+            try:
+                extra = gather_phonebook_results(
+                    ix, discovered, pb_domain, buckets, date_from, date_to,
+                    args.maxresults, args.phonebook_max, log,
+                )
+                before = len(results)
+                _merge_results(results, extra)
+                log.info(f"Phonebook-search added {len(results) - before} new leak(s) to process")
+            except EXPECTED_LEAK_ERRORS as e:
+                log.warning(f"Phonebook-search failed ({e}); keeping primary results")
+        else:
+            log.warning(
+                "--phonebook-search needs a domain anchor (email/domain target, or "
+                "--domain for a person); skipping the discovered-email hunt"
+            )
+
+    # Expand archives once, after phonebook-search, so discovered leaks are covered too.
+    if args.expand_archives:
+        try:
+            results = expand_container_leaks(ix, results, log)
+        except EXPECTED_LEAK_ERRORS as e:
+            log.error(f"Archive expansion failed ({e}); continuing with unexpanded results")
 
     seen = load_existing_dedup(output_file, args.format, log)
 
