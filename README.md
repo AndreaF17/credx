@@ -129,7 +129,7 @@ credx -t example.com --workers 4 --delay 0.5
 | Flag | Argument | Default | Description |
 |---|---|---|---|
 | `-t`, `--target` | `TARGET` | *(required)* | Domain or email to search |
-| `-m`, `--maxresults` | `N` | `100` | Max results to return |
+| `-m`, `--maxresults` | `N` | `500` | Max results to return |
 | `-k`, `--apikey` | `KEY` | from `.env` | IntelX API key |
 | `-o`, `--output` | `FILE` | `<target>-creds.<ext>` | Output file |
 | `-f`, `--format` | `txt\|json\|csv` | `txt` | Output format |
