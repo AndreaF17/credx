@@ -96,14 +96,17 @@ Get a key at [intelx.io](https://intelx.io/). Never commit your `.env` file.
 credx can store several keys and switch between them — handy when you work across clients or engagements:
 
 ```bash
-credx config set-key KEY                 # save as "default" (first key becomes active)
-credx config set-key KEY --name client-a # save another key under a name
+credx config set-key                     # prompt for the key (hidden; keeps it out of shell history)
+credx config set-key KEY --name client-a # save a key under a name (KEY as an arg; warns about history)
+echo "$KEY" | credx config set-key --stdin --name ci   # from a pipe, for scripts
 credx config use client-a                # switch the active key
 credx config list                        # list saved keys (masked), * marks the active one
 credx config show --name client-a        # show one key (masked)
 credx config usage                       # show the active key's IntelX credit usage
 credx config clear client-a              # remove one key  (or: --all to remove every key)
 ```
+
+> Prefer `credx config set-key` with no argument (secure prompt) or `--stdin`: a key passed as a positional argument is visible in your shell history and process list.
 
 Pick a saved key for a single run without switching the active one:
 
@@ -129,6 +132,8 @@ credx auto-detects what you're targeting from `-t` and switches modes:
 A target with a space (e.g. `"John Doe"`), or any non-email target combined with `--domain`, triggers **person-name mode**. With `--domain`, a result must mention both the name and the domain to match, which cuts false positives sharply.
 
 > By default credx searches the last **24 months** — most breach data is older, so widen with `-r` (e.g. `-r 60`) for historical coverage, or narrow it for recency.
+
+**Multiple targets.** `-t` also accepts a comma-separated list (`-t "corp.com,acme.com"`) or a file (`-t targets.txt`, one target per line, `#` comments allowed). Each target can be a domain, email, or person name — credx detects the mode per target. With more than one target it writes a per-target file **and** a combined `out/batch-creds.<ext>` (a `target` field/column marks which target each credential matched); choose the layout with `--output-mode per-target|combined|both`.
 
 ---
 
@@ -170,6 +175,11 @@ credx -t example.com --phonebook-search   # then hunt creds for each discovered 
 # Search deeper: results are paginated automatically — just raise -m
 credx -t example.com -m 2000
 
+# Scan several targets at once: a comma-list or a file (one target per line)
+credx -t "corp.com,acme.com,john.doe@corp.com"
+credx -t targets.txt                       # out/<target>-creds.* per target + out/batch-creds.*
+credx -t targets.txt --output-mode combined  # only the combined file (with a 'target' column)
+
 # Share results with a client, anonymized
 credx -t example.com --safe-share
 
@@ -185,7 +195,8 @@ credx -t example.com --workers 4 --delay 0.5
 
 | Flag | Argument | Default | Description |
 |---|---|---|---|
-| `-t`, `--target` | `TARGET` | *(required)* | Domain, email, or person name to search |
+| `-t`, `--target` | `TARGET` | *(required)* | A single target, a comma-separated list, or a file (one target per line) |
+| `--output-mode` | `per-target\|combined\|both` | `both` | For multiple targets: per-target files, one combined file, or both |
 | `-m`, `--maxresults` | `N` | `500` | Max results to return |
 | `-k`, `--apikey` | `KEY` | from env/saved | IntelX API key (overrides env var and saved key) |
 | `--key-name` | `NAME` | active key | Use a saved key by name for this run (see `credx config`) |
@@ -313,6 +324,7 @@ credx -t example.com   # continues where it left off
 - **Flexible extraction** — handles `:`, `;`, `|`, and key/value dumps, plus multiple credentials per line
 - **Structured-dump parsing** — reads SQL `INSERT` statements, JSON/NDJSON exports, and header-named CSV (where the credential columns are named), not just delimited combolists
 - **Multi-key management** — save, name, switch and inspect multiple IntelX keys (`credx config`), with per-key credit-usage reporting
+- **Batch targets** — scan a comma-list or a file of targets in one run, writing per-target files and/or a combined report (`--output-mode`)
 - **Password-hash detection** — tags each secret as plaintext or a hash type (MD5, SHA-1/256/512, bcrypt, argon2, md5crypt…), so you know what you're cracking
 - **False-positive filtering** with confidence scoring on every match
 - **Optional ML scorer** (stdlib logistic regression) for the cases the heuristic over-trusts

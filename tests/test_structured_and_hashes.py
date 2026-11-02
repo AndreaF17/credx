@@ -617,10 +617,73 @@ class HeaderCsvFallbackTests(unittest.TestCase):
         self.assertEqual(new[0]['pattern'], 'sql_insert')
 
     def test_large_field_does_not_drop_later_rows(self):
-        big = 'x' * 200000  # > the 128 KB default csv field limit
+        big = 'x' * 200000  # > the 128 KB default csv field limit, < the 1 MB cap
         content = f'email,password,blob\nalice@corp.com,Good1pw,{big}\nbob@corp.com,Good2pw,small'
         new = self._run(content)
         self.assertEqual({c['identity'] for c in new}, {'alice@corp.com', 'bob@corp.com'})
+
+
+class HeaderCsvResourceCapTests(unittest.TestCase):
+    """CSV parsing must honor resource caps like the per-line path (security review)."""
+
+    def test_oversized_password_field_is_skipped(self):
+        blobpw = 'x' * 5000  # > _CSV_MAX_VALUE_LEN: a blob, not a credential
+        content = f'email,password\na@corp.com,{blobpw}\nb@corp.com,Normal12'
+        cands = ce.extract_credentials_from_csv(content) or []
+        pairs = {(c['identity'], c['password']) for c in cands}
+        self.assertIn(('b@corp.com', 'Normal12'), pairs)
+        self.assertNotIn('a@corp.com', {c['identity'] for c in cands})
+
+    def test_field_size_limit_is_restored(self):
+        import csv as _csv
+        before = _csv.field_size_limit()
+        ce.extract_credentials_from_csv('email,password\na@corp.com,Secret12')
+        self.assertEqual(_csv.field_size_limit(), before)
+
+    def test_stored_raw_line_is_bounded(self):
+        from custom.credential_extractor import _MAX_LINE_LEN
+        big = 'x' * 300000
+        content = f'email,password,blob\na@corp.com,Good1pw,{big}'
+        best = (ce.extract_credentials_from_csv(content) or [])[0]
+        self.assertLessEqual(len(best['raw_line']), _MAX_LINE_LEN)
+
+    def test_multi_megabyte_blob_column_does_not_abort_parse(self):
+        # A 2 MB blob column (> the old 1 MB cap, < the 10 MB field limit) must not
+        # abort the reader and drop later rows.
+        big = 'x' * (2 * 1024 * 1024)
+        content = f'email,password,blob\nalice@corp.com,Good1pw,{big}\nbob@corp.com,Good2pw,s'
+        cands = ce.extract_credentials_from_csv(content) or []
+        self.assertEqual({c['identity'] for c in cands}, {'alice@corp.com', 'bob@corp.com'})
+
+
+class CsvLegacyResumeTests(unittest.TestCase):
+    """Appending 'target' as the LAST CSV column must not corrupt rows when resuming
+    a pre-0.2 CSV whose header has no 'target' column (review finding)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = logging.getLogger('test')
+        self.log.addHandler(logging.NullHandler())
+
+    def test_resume_old_header_keeps_columns_aligned(self):
+        import csv as _csv
+        path = os.path.join(self.tmp.name, 'old.csv')
+        # Pre-0.2 header: 11 columns, no 'target'.
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write('url,identity,email,password,secret_type,date,source,confidence,pattern,canonical,raw_line\n')
+            f.write('old.com,olduser,,OldPass1,plaintext,2024-01-01,src,0.9,host_delimited,c1,r1\n')
+        main.write_csv_output([{
+            'url': 'new.com', 'identity': 'newuser', 'email': '', 'password': 'NewPass2',
+            'secret_type': 'plaintext', 'date': '2024-02-02', 'source': 's2', 'confidence': 0.9,
+            'pattern': 'host_delimited', 'canonical': 'c2', 'raw_line': 'r2', 'target': 'new.com',
+        }], path, self.log)
+        with open(path, encoding='utf-8') as f:
+            rows = list(_csv.DictReader(f))
+        new_row = next(r for r in rows if r['identity'] == 'newuser')
+        # The original columns must still align (not shifted by the new trailing field).
+        self.assertEqual(new_row['url'], 'new.com')
+        self.assertEqual(new_row['password'], 'NewPass2')
 
 
 class HeaderCsvIntegrationTests(unittest.TestCase):

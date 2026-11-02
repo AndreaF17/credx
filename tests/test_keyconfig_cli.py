@@ -81,6 +81,39 @@ class HandleConfigTests(_XdgTempMixin, unittest.TestCase):
         _, out = self._run(config_action='set-key', key='SuperSecretKey123', name='default', use=False)
         self.assertNotIn('SuperSecretKey123', out)
 
+    def test_set_key_from_stdin(self):
+        import io as _io
+        import sys as _sys
+        orig = _sys.stdin
+        _sys.stdin = _io.StringIO('KEYFROMSTDIN\n')
+        try:
+            args = argparse.Namespace(command='config', config_action='set-key',
+                                      key=None, name='default', use=False, stdin=True)
+            with contextlib.redirect_stdout(_io.StringIO()):
+                code = main.handle_config(args, self.log)
+        finally:
+            _sys.stdin = orig
+        self.assertEqual(code, 0)
+        self.assertEqual(keystore.get_key(), 'KEYFROMSTDIN')
+
+    def test_set_key_prompts_when_omitted(self):
+        import getpass as _getpass
+        orig = _getpass.getpass
+        _getpass.getpass = lambda *a, **k: 'PROMPTEDKEY'
+        try:
+            args = argparse.Namespace(command='config', config_action='set-key',
+                                      key=None, name='default', use=False, stdin=False)
+            with contextlib.redirect_stdout(__import__('io').StringIO()):
+                code = main.handle_config(args, self.log)
+        finally:
+            _getpass.getpass = orig
+        self.assertEqual(code, 0)
+        self.assertEqual(keystore.get_key(), 'PROMPTEDKEY')
+
+    def test_set_key_arg_is_optional_in_parser(self):
+        args = main.parse_args(['config', 'set-key'])
+        self.assertIsNone(args.key)
+
     def test_list_marks_active_and_masks(self):
         keystore.set_key('default', 'abcd1234efgh5678')
         keystore.set_key('client', 'zzzz9999yyyy8888')

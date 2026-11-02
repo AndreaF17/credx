@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import html as html_lib
 import importlib
 import io
@@ -26,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple
 
 import colorlog
 from dateutil.relativedelta import relativedelta
@@ -138,6 +139,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument('-o', '--output', type=str, help='Output file to save the results', default=None)
     parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv', 'html'], help='Output format (txt, json, csv, html)', default='txt')
+    parser.add_argument(
+        '--output-mode', choices=['per-target', 'combined', 'both'], default='both',
+        help='With multiple targets: write per-target files, a single combined file, '
+             'or both (default). Ignored for a single target.',
+    )
     parser.add_argument('-r', '--range', type=int, help='Search range in months', default=DEFAULT_RANGE_MONTHS)
     parser.add_argument('-d', '--debug', action='store_true', help='Enable DEBUG logging (default: INFO)')
     parser.add_argument(
@@ -240,9 +246,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     config_sub = config_parser.add_subparsers(dest='config_action', required=True)
 
     set_key_p = config_sub.add_parser('set-key', help='Save an API key (the first one becomes active)')
-    set_key_p.add_argument('key', help='The IntelX API key to save')
+    set_key_p.add_argument(
+        'key', nargs='?', default=None,
+        help='The IntelX API key. Omit to be prompted securely (avoids shell history / process list).',
+    )
     set_key_p.add_argument('--name', default=keystore.DEFAULT_KEY_NAME, help='Name to save it under (default: default)')
     set_key_p.add_argument('--use', action='store_true', help='Also make this the active key')
+    set_key_p.add_argument('--stdin', action='store_true', help='Read the key from stdin (for scripts/pipes)')
 
     config_sub.add_parser('list', help='List saved keys (masked), marking the active one')
 
@@ -423,10 +433,23 @@ def handle_config(args: argparse.Namespace, log: logging.Logger) -> int:
     action = args.config_action
 
     if action == 'set-key':
-        keystore.set_key(args.name, args.key, make_active=args.use)
+        if getattr(args, 'stdin', False):
+            key = sys.stdin.readline().strip()
+        elif args.key is None:
+            key = getpass.getpass('IntelX API key: ').strip()
+        else:
+            key = args.key
+            log.warning(
+                "Key passed as an argument is visible in your shell history and process list; "
+                "omit it to be prompted securely, or use --stdin."
+            )
+        if not key:
+            log.error("No API key provided")
+            return 2
+        keystore.set_key(args.name, key, make_active=args.use)
         active = keystore.load_config().get('active')
         note = ' (now active)' if active == args.name else ''
-        print(f"Saved key '{args.name}' [{keystore.mask_key(args.key)}]{note}")
+        print(f"Saved key '{args.name}' [{keystore.mask_key(key)}]{note}")
         return 0
 
     if action == 'list':
@@ -514,6 +537,47 @@ def resolve_output_path(args: argparse.Namespace) -> str:
         target = sanitize_filename(args.target, fallback='target')
         return os.path.join('out', f"{target}-creds.{args.format}")
     return os.path.join('out', sanitize_filename(args.output))
+
+
+def per_target_output_path(target: str, output_format: str) -> str:
+    """Per-target output path inside ``out/`` (used for batch/multi-target runs)."""
+    return os.path.join('out', f"{sanitize_filename(target, fallback='target')}-creds.{output_format}")
+
+
+def collect_targets(value: Optional[str]) -> List[str]:
+    """Expand a ``-t`` value into a target list.
+
+    The value may be an existing file (one target per line; blank lines and
+    ``#`` comments skipped), a comma-separated list, or a single target. The
+    result is de-duplicated case-insensitively, preserving first-seen order.
+    """
+    if not value or not value.strip():
+        return []
+    raw: List[str] = []
+    if os.path.isfile(value):
+        try:
+            with open(value, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        raw.append(line)
+        except OSError:
+            return []
+    elif ',' in value:
+        raw = [part.strip() for part in value.split(',')]
+    else:
+        raw = [value.strip()]
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for target in raw:
+        if not target:
+            continue
+        key = target.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(target)
+    return out
 
 
 def compute_date_range(range_months: int, now: Optional[datetime] = None) -> Tuple[str, str]:
@@ -1548,6 +1612,10 @@ CSV_FIELDNAMES = [
     'pattern',
     'canonical',
     'raw_line',
+    # 'target' is appended LAST so resuming a pre-0.2 CSV (header without it) keeps
+    # every original column aligned — a new row's extra trailing value just lands
+    # in the reader's restkey instead of shifting url/identity/password.
+    'target',
 ]
 
 
@@ -1663,6 +1731,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <table>
     <thead>
       <tr>
+        <th data-k="target">Target</th>
         <th data-k="date">Date</th>
         <th data-k="source">Source</th>
         <th data-k="url">URL</th>
@@ -1708,7 +1777,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     var showAll = reveal.checked;
     var rows = data.filter(function (r) {
       if (!term) return true;
-      return [r.identity, r.email, r.url, r.password, r.secret_type, r.source, r.pattern, r.date]
+      return [r.target, r.identity, r.email, r.url, r.password, r.secret_type, r.source, r.pattern, r.date]
         .some(function (v) { return String(v || "").toLowerCase().indexOf(term) !== -1; });
     });
     rows.sort(function (a, b) {
@@ -1722,6 +1791,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       var shown = showAll ? pw : esc(mask(r.password));
       var conf = (Number(r.confidence) || 0).toFixed(2);
       return "<tr>" +
+        "<td>" + esc(r.target || "") + "</td>" +
         "<td>" + esc(r.date || "") + "</td>" +
         "<td>" + esc(r.source || "") + "</td>" +
         "<td class='mono'>" + esc(r.url || "") + "</td>" +
@@ -1860,48 +1930,41 @@ def write_output(
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
-def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entry point. Returns a process exit code."""
-    args = parse_args(argv)
-    log = configure_logging(args.debug)
+class TargetRun(NamedTuple):
+    """Outcome of run_for_target. ``code`` is the exit code a single-target run uses
+    (0 ok, 1 generic error, 2 all-searches-failed); ``searched_ok`` is True once the
+    search+extract ran (used by a batch to count successes even if the write failed)."""
+    code: int
+    written: int
+    new_creds: List[Dict[str, Any]]
+    searched_ok: bool
 
-    # `credx config ...` manages saved API keys and exits before any search.
-    if getattr(args, 'command', None) == 'config':
-        return handle_config(args, log)
 
-    output_file = resolve_output_path(args)
-    if args.output:
-        ext = os.path.splitext(output_file)[1].lstrip('.').lower()
-        if ext and ext != args.format:
-            log.warning(
-                f"Output file extension '.{ext}' does not match --format {args.format}; "
-                f"{args.format}-formatted content will be written to {output_file}."
-            )
+def run_for_target(
+    target: str,
+    args: argparse.Namespace,
+    ix: Any,
+    buckets: Iterable[str],
+    date_from: str,
+    date_to: str,
+    scorer: Optional[ConfidenceModel],
+    log: logging.Logger,
+    *,
+    output_file: str,
+    seen: Set[str],
+    write_file: bool = True,
+    safe_output_arg: Optional[str] = None,
+    warn_flags: bool = True,
+) -> TargetRun:
+    """Run the full search → extract → write pipeline for a single target.
 
-    api_key = resolve_api_key(args, log)
-    if not api_key:
-        log.error(
-            "API key is required. Please provide it using -k or set INTELX_API_KEY in your environment variables."
-        )
-        return 1
-
-    intelx_client = load_intelx_client()
-    if intelx_client is None:
-        log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
-        return 1
-
-    date_from, date_to = compute_date_range(args.range)
-    log.info(f"Searching from {date_from} to {date_to}")
-
-    target = args.target
+    ``new_creds`` are tagged with ``target``. When ``write_file`` is False the
+    credentials are returned but not written (combined-only batch mode).
+    """
     target_is_email = is_email_target(target)
-    # Person-name mode: a non-email, non-domain target (e.g. "John Doe"). A bare
-    # single-token target (no dotted TLD) paired with --domain is also a person
-    # name; a real domain (corp.com) stays in domain mode even with --domain.
     target_is_person_name = (not target_is_email) and (
         not looks_like_domain(target) or (bool(args.domain) and not has_dotted_tld(target))
     )
-
     target_context = build_target_context(target)
     person_context = (
         build_person_email_context(target, person_name=args.person_name) if target_is_email else None
@@ -1910,17 +1973,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         build_person_name_context(target, domain=args.domain) if target_is_person_name else None
     )
 
-    # Flag-applicability feedback: warn when a flag has no effect for this target type.
-    if args.person_name and not target_is_email:
-        log.warning("--person-name only enriches an email target; ignoring it here")
-    if args.domain and not target_is_person_name:
-        log.warning("--domain only applies to a person-name target; ignoring it here")
-    if args.email and not target_is_email:
-        log.warning("--email only applies to an email target; ignoring it here")
-    if args.usernames and not target_is_email:
-        log.warning("--usernames only applies to an email target; ignoring it here")
-    if args.company_wide and target_is_email:
-        log.warning("--company-wide only applies to a domain target; ignoring it here")
+    if warn_flags:
+        if args.person_name and not target_is_email:
+            log.warning("--person-name only enriches an email target; ignoring it here")
+        if args.domain and not target_is_person_name:
+            log.warning("--domain only applies to a person-name target; ignoring it here")
+        if args.email and not target_is_email:
+            log.warning("--email only applies to an email target; ignoring it here")
+        if args.usernames and not target_is_email:
+            log.warning("--usernames only applies to an email target; ignoring it here")
+        if args.company_wide and target_is_email:
+            log.warning("--company-wide only applies to a domain target; ignoring it here")
 
     if target_is_person_name:
         search_terms = build_name_search_terms(target, domain=args.domain)
@@ -1932,30 +1995,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             company_wide=args.company_wide,
             include_usernames=args.usernames,
         )
-
     if not search_terms:
         log.error(f"Could not build any search terms for target '{target}'")
-        return 1
-
-    # Load the ML model (if any) BEFORE the rate-limited search, so a bad --model
-    # path fails fast instead of after the whole run.
-    scorer: Optional[ConfidenceModel] = None
-    if args.model:
-        scorer = ConfidenceModel.load(args.model)
-        if scorer is None:
-            log.warning(
-                f"Confidence model not usable at '{args.model}'; falling back to heuristic scoring. "
-                "Train one with: credx-train"
-            )
-        else:
-            log.info(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
+        return TargetRun(1, 0, [], False)
 
     if target_is_person_name:
         if args.domain:
-            log.info(
-                f"Person-name mode: {len(search_terms)} term(s) for '{target}', "
-                f"anchored to domain '{args.domain}'."
-            )
+            log.info(f"Person-name mode: {len(search_terms)} term(s) for '{target}', anchored to domain '{args.domain}'.")
         else:
             log.warning(
                 f"Person-name mode without --domain: searching '{target}' broadly. "
@@ -1971,18 +2017,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.info("Company-wide search enabled: also sweeping the bare domain")
 
     try:
-        ix = intelx_client(api_key)
-        log.debug(f"IntelX API initialized for target: {target}")
-        buckets = resolve_buckets(ix, log)
         results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
     except AllSearchesFailed as e:
         log.error(str(e))
-        return 2
+        return TargetRun(2, 0, [], False)
     except EXPECTED_LEAK_ERRORS as e:
-        log.error(f"Error searching IntelX API: {e}")
-        return 1
-
-    os.makedirs('out', exist_ok=True)
+        log.error(f"Error searching IntelX API for '{target}': {e}")
+        return TargetRun(1, 0, [], False)
 
     discovered: List[str] = []
     if args.phonebook:
@@ -1995,12 +2036,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if value.lower() not in discovered_seen:
                         discovered_seen.add(value.lower())
                         discovered.append(value)
-            emails_path = os.path.join('out', f"{sanitize_filename(args.target, fallback='target')}-emails.txt")
+            emails_path = os.path.join('out', f"{sanitize_filename(target, fallback='target')}-emails.txt")
             write_phonebook_output(discovered, emails_path, log)
         except EXPECTED_LEAK_ERRORS as e:
             log.error(f"Phonebook discovery failed: {e}")
 
-    # Phonebook-search: feed domain-matching discovered emails back into the hunt.
     if args.phonebook_search:
         pb_domain = resolve_phonebook_domain(target, args.domain, is_person_name=target_is_person_name)
         if pb_domain:
@@ -2020,14 +2060,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "--domain for a person); skipping the discovered-email hunt"
             )
 
-    # Expand archives once, after phonebook-search, so discovered leaks are covered too.
     if args.expand_archives:
         try:
             results = expand_container_leaks(ix, results, log)
         except EXPECTED_LEAK_ERRORS as e:
             log.error(f"Archive expansion failed ({e}); continuing with unexpanded results")
-
-    seen = load_existing_dedup(output_file, args.format, log)
 
     new_creds, stats = process_leaks(
         ix,
@@ -2042,38 +2079,170 @@ def main(argv: Optional[List[str]] = None) -> int:
         delay=args.delay,
         scorer=scorer,
     )
+    for cred in new_creds:
+        cred['target'] = target
 
     written = 0
-    try:
-        if not new_creds:
-            log.info(colorize("No new credentials found", 'yellow'))
-        else:
-            written = write_output(new_creds, output_file, args.format, log)
-            log.info(
-                f"Wrote {colorize(written, 'bold', 'green')} new credentials to: "
-                f"{colorize(output_file, 'cyan')}"
-            )
-    except OSError as e:
-        log.error(f"Cannot create/write to output file {output_file}: {e}")
-        return 1
-
-    if args.safe_share:
+    write_failed = False
+    if write_file:
         try:
-            safe_output_file = resolve_safe_output_path(output_file, args.safe_output)
-            if os.path.exists(output_file):
-                safe_count = write_safe_share_file(output_file, args.format, safe_output_file)
+            if not new_creds:
+                log.info(colorize("No new credentials found", 'yellow'))
             else:
-                safe_count = 0
+                written = write_output(new_creds, output_file, args.format, log)
+                log.info(
+                    f"Wrote {colorize(written, 'bold', 'green')} new credentials to: "
+                    f"{colorize(output_file, 'cyan')}"
+                )
+        except OSError as e:
+            log.error(f"Cannot create/write to output file {output_file}: {e}")
+            write_failed = True
 
-            if safe_count > 0:
-                log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_output_file}")
-            else:
-                log.info("Safe-share skipped: 0 anonymized credentials")
-        except (OSError, ValueError, json.JSONDecodeError, csv.Error) as e:
-            log.error(f"Failed to create safe-share output: {e}")
+        if args.safe_share:
+            try:
+                safe_output_file = resolve_safe_output_path(output_file, safe_output_arg)
+                safe_count = (
+                    write_safe_share_file(output_file, args.format, safe_output_file)
+                    if os.path.exists(output_file) else 0
+                )
+                if safe_count > 0:
+                    log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_output_file}")
+                else:
+                    log.info("Safe-share skipped: 0 anonymized credentials")
+            except (OSError, ValueError, json.JSONDecodeError, csv.Error) as e:
+                log.error(f"Failed to create safe-share output: {e}")
 
     print_run_summary(target, written, len(seen), args.mode, stats)
-    return 0
+    return TargetRun(1 if write_failed else 0, written, new_creds, True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point. Returns a process exit code."""
+    args = parse_args(argv)
+    log = configure_logging(args.debug)
+
+    # `credx config ...` manages saved API keys and exits before any search.
+    if getattr(args, 'command', None) == 'config':
+        return handle_config(args, log)
+
+    api_key = resolve_api_key(args, log)
+    if not api_key:
+        log.error(
+            "API key is required. Save one with 'credx config set-key', pass -k, "
+            "or set INTELX_API_KEY in your environment."
+        )
+        return 1
+
+    intelx_client = load_intelx_client()
+    if intelx_client is None:
+        log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
+        return 1
+
+    targets = collect_targets(args.target)
+    if not targets:
+        log.error("No targets to search. Pass -t <target|list|file>.")
+        return 2
+    if args.target and os.path.isfile(args.target):
+        log.info(f"Reading {len(targets)} target(s) from file: {args.target}")
+
+    date_from, date_to = compute_date_range(args.range)
+    log.info(f"Searching from {date_from} to {date_to}")
+
+    # Load the ML model (if any) BEFORE the rate-limited search(es), so a bad
+    # --model path fails fast instead of after a long run.
+    scorer: Optional[ConfidenceModel] = None
+    if args.model:
+        scorer = ConfidenceModel.load(args.model)
+        if scorer is None:
+            log.warning(
+                f"Confidence model not usable at '{args.model}'; falling back to heuristic scoring. "
+                "Train one with: credx-train"
+            )
+        else:
+            log.info(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
+
+    try:
+        ix = intelx_client(api_key)
+        buckets = resolve_buckets(ix, log)
+    except EXPECTED_LEAK_ERRORS as e:
+        log.error(f"Error initializing IntelX API: {e}")
+        return 1
+
+    os.makedirs('out', exist_ok=True)
+
+    # Single target: identical behavior to a classic run (respects -o).
+    if len(targets) == 1:
+        target = targets[0]
+        args.target = target  # so resolve_output_path / naming use the resolved target
+        output_file = resolve_output_path(args)
+        if args.output:
+            ext = os.path.splitext(output_file)[1].lstrip('.').lower()
+            if ext and ext != args.format:
+                log.warning(
+                    f"Output file extension '.{ext}' does not match --format {args.format}; "
+                    f"{args.format}-formatted content will be written to {output_file}."
+                )
+        seen = load_existing_dedup(output_file, args.format, log)
+        result = run_for_target(
+            target, args, ix, buckets, date_from, date_to, scorer, log,
+            output_file=output_file, seen=seen, write_file=True,
+            safe_output_arg=args.safe_output, warn_flags=True,
+        )
+        return result.code
+
+    # Multiple targets: run each, then (per --output-mode) write per-target files,
+    # a combined file (with a 'target' field), or both.
+    write_per_target = args.output_mode in ('per-target', 'both')
+    write_combined = args.output_mode in ('combined', 'both')
+    log.info(colorize(f"Batch: {len(targets)} targets · output-mode={args.output_mode}", 'bold', 'magenta'))
+
+    all_new: List[Dict[str, Any]] = []
+    succeeded = 0
+    for index, target in enumerate(targets, 1):
+        log.info(colorize(f"[{index}/{len(targets)}] {target}", 'bold', 'cyan'))
+        pt_path = per_target_output_path(target, args.format)
+        pt_seen = load_existing_dedup(pt_path, args.format, log) if write_per_target else set()
+        result = run_for_target(
+            target, args, ix, buckets, date_from, date_to, scorer, log,
+            output_file=pt_path, seen=pt_seen, write_file=write_per_target,
+            safe_output_arg=None, warn_flags=False,
+        )
+        if result.searched_ok:
+            succeeded += 1
+        all_new.extend(result.new_creds)
+
+    combined_written = 0
+    if write_combined:
+        combined_path = (
+            os.path.join('out', sanitize_filename(args.output)) if args.output
+            else os.path.join('out', f"batch-creds.{args.format}")
+        )
+        comb_seen = load_existing_dedup(combined_path, args.format, log)
+        combined_new: List[Dict[str, Any]] = []
+        for cred in all_new:
+            key = _dedup_key(cred)
+            if key not in comb_seen:
+                comb_seen.add(key)
+                combined_new.append(cred)
+        if combined_new:
+            try:
+                combined_written = write_output(combined_new, combined_path, args.format, log)
+                log.info(
+                    f"Wrote {colorize(combined_written, 'bold', 'green')} credential(s) to combined file: "
+                    f"{colorize(combined_path, 'cyan')}"
+                )
+                if args.safe_share and os.path.exists(combined_path):
+                    safe_path = resolve_safe_output_path(combined_path, args.safe_output)
+                    safe_count = write_safe_share_file(combined_path, args.format, safe_path)
+                    if safe_count > 0:
+                        log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_path}")
+            except (OSError, ValueError, json.JSONDecodeError, csv.Error) as e:
+                log.error(f"Failed to write combined output {combined_path}: {e}")
+        else:
+            log.info("Combined file: no new credentials")
+
+    print_batch_summary(len(targets), succeeded, all_new, args.output_mode, combined_written)
+    return 0 if succeeded else 2
 
 
 def print_run_summary(
@@ -2107,6 +2276,35 @@ def print_run_summary(
         f"    skipped — pattern {colorize(stats['pattern_skips'], 'yellow')}  "
         f"low-conf {colorize(stats['low_confidence_skips'], 'yellow')}  "
         f"off-target {colorize(stats['target_skips'], 'yellow')}",
+        bar,
+        '',
+    ]
+    print('\n'.join(lines), file=sys.stderr)
+
+
+def print_batch_summary(
+    total_targets: int,
+    succeeded: int,
+    all_new: List[Dict[str, Any]],
+    output_mode: str,
+    combined_written: int = 0,
+) -> None:
+    """Print a grand-total summary after a multi-target batch run (to stderr)."""
+    bar = colorize('═' * 52, 'dim')
+    unique = len({_dedup_key(c) for c in all_new})
+    failed = total_targets - succeeded
+    lines = [
+        '',
+        bar,
+        colorize(' credx — batch summary ', 'bold', 'magenta'),
+        bar,
+        f"  {colorize('Targets'.ljust(24), 'bold')}  "
+        f"{colorize(succeeded, 'green')} ok / {colorize(failed, 'yellow' if failed else 'dim')} failed "
+        f"of {total_targets}",
+        f"  {colorize('New credentials'.ljust(24), 'bold')}  "
+        f"{colorize(len(all_new), 'bold', 'green')} ({colorize(unique, 'cyan')} unique)",
+        f"  {colorize('Output mode'.ljust(24), 'bold')}  {output_mode}"
+        + (f"  ·  combined: {colorize(combined_written, 'green')}" if combined_written else ''),
         bar,
         '',
     ]

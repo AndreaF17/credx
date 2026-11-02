@@ -757,9 +757,15 @@ _SQL_INSERT_RE = re.compile(
 # (one giant multi-row INSERT) can't tie up a worker.
 _SQL_MAX_TUPLES = 5000
 
-# Per-field size cap for CSV parsing (10 MB): large enough for real blob columns,
-# bounded against a pathological single field. Content is already in memory.
+# Per-field read cap for CSV parsing (10 MB): large enough that a real base64/blob
+# column doesn't abort the parse (and drop every later row), while still bounded —
+# the content is already fully in memory, so this adds no amplification. Applied via
+# a save/restore of csv.field_size_limit so the process-global setting is unchanged;
+# the extracted identity/password values are separately capped at _CSV_MAX_VALUE_LEN.
 _CSV_FIELD_LIMIT = 10 * 1024 * 1024
+# A real identity/password is short; a longer field is a blob column, not a
+# credential, so such a row is skipped (mirrors the per-line _MAX_* DoS caps).
+_CSV_MAX_VALUE_LEN = 1024
 
 
 def _field_tokens(name):
@@ -969,51 +975,67 @@ def extract_credentials_from_csv(contents, mode=DEFAULT_MODE):
     newlines are handled correctly.
     """
     # Real breach CSVs often carry a large base64/blob/session column; raise the
-    # per-field limit (default 128 KB) so one big field doesn't abort the parse and
-    # silently drop every row after it.
-    try:
-        csv.field_size_limit(_CSV_FIELD_LIMIT)
-    except (OverflowError, ValueError):
-        pass
-
-    reader = csv.reader(io.StringIO(contents))
-    try:
-        header = next(reader)
-    except (StopIteration, csv.Error):
-        return None
-    if len(header) < 2:  # a real CSV header is a row of >= 2 column names
-        return None
-
-    identity_idx = _match_column_index(
-        header, _FIELD_IDENTITY_EXACT, _FIELD_IDENTITY_TOKEN, _IDENTITY_SKIP_TOKENS
-    )
-    password_idx = _match_column_index(
-        header, _FIELD_PASSWORD_EXACT, _FIELD_PASSWORD_TOKEN, _FIELD_SKIP_TOKENS
-    )
-    if identity_idx is None or password_idx is None:
-        return None
-    url_idx = _match_column_index(header, _FIELD_URL_EXACT, _FIELD_URL_TOKEN, _FIELD_SKIP_TOKENS)
-
+    # per-field limit so one big field doesn't abort the parse and drop every row
+    # after it — but save and restore it so the process-global setting is unchanged.
+    previous_limit = csv.field_size_limit()
     candidates = []
     seen = set()
-    needed = max(identity_idx, password_idx)
     try:
-        for row in reader:
-            if len(row) <= needed:
-                continue
-            identity = row[identity_idx].strip()
-            password = row[password_idx].strip()
-            url_part = row[url_idx].strip() if (url_idx is not None and url_idx < len(row)) else ''
-            if identity and password:
-                # The header names the password column, so no URL/email anchor is required.
-                _build_candidate(
-                    candidates, seen, identity, password, url_part, 'csv_row', ','.join(row),
-                    require_anchor=False,
-                )
-    except csv.Error:
-        # A malformed tail (field beyond even the raised limit) ends parsing; keep
-        # what was already extracted rather than discarding the whole file.
-        pass
+        try:
+            csv.field_size_limit(_CSV_FIELD_LIMIT)
+        except (OverflowError, ValueError):
+            pass
+
+        reader = csv.reader(io.StringIO(contents))
+        try:
+            header = next(reader)
+        except (StopIteration, csv.Error):
+            return None
+        if len(header) < 2:  # a real CSV header is a row of >= 2 column names
+            return None
+
+        identity_idx = _match_column_index(
+            header, _FIELD_IDENTITY_EXACT, _FIELD_IDENTITY_TOKEN, _IDENTITY_SKIP_TOKENS
+        )
+        password_idx = _match_column_index(
+            header, _FIELD_PASSWORD_EXACT, _FIELD_PASSWORD_TOKEN, _FIELD_SKIP_TOKENS
+        )
+        if identity_idx is None or password_idx is None:
+            return None
+        url_idx = _match_column_index(header, _FIELD_URL_EXACT, _FIELD_URL_TOKEN, _FIELD_SKIP_TOKENS)
+
+        needed = max(identity_idx, password_idx)
+        try:
+            for row in reader:
+                if len(row) <= needed:
+                    continue
+                identity = row[identity_idx].strip()
+                password = row[password_idx].strip()
+                # A real credential field is short; a longer one is a blob column.
+                if len(identity) > _CSV_MAX_VALUE_LEN or len(password) > _CSV_MAX_VALUE_LEN:
+                    continue
+                url_part = row[url_idx].strip() if (url_idx is not None and url_idx < len(row)) else ''
+                if len(url_part) > _CSV_MAX_VALUE_LEN:
+                    url_part = ''
+                if identity and password:
+                    raw_line = ','.join(row)
+                    if len(raw_line) > _MAX_LINE_LEN:
+                        raw_line = raw_line[:_MAX_LINE_LEN]
+                    # The header names the password column, so no URL/email anchor is required.
+                    _build_candidate(
+                        candidates, seen, identity, password, url_part, 'csv_row', raw_line,
+                        require_anchor=False,
+                    )
+        except csv.Error:
+            # A field beyond even the raised limit ends parsing; keep what was
+            # already extracted rather than discarding the whole file.
+            pass
+    finally:
+        try:
+            csv.field_size_limit(previous_limit)
+        except (OverflowError, ValueError):
+            pass
+
     # Return None (not []) when nothing parsed, so the caller falls back to the
     # per-line parsers — the header alone is not proof the body is really CSV.
     return candidates or None
