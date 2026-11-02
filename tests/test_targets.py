@@ -152,6 +152,16 @@ class BatchRunIntegrationTests(unittest.TestCase):
         self.assertTrue(os.path.exists('out/a.com-creds.json'))
         self.assertFalse(os.path.exists('out/batch-creds.json'))  # no combined for single
 
+    def test_local_merges_with_intelx(self):
+        os.makedirs('dumps', exist_ok=True)
+        with open('dumps/x.txt', 'w', encoding='utf-8') as f:
+            f.write('a.com:localuser:LocalPass9\n')
+        rc = main.main(['-t', 'a.com', '--local', 'dumps', '-f', 'json', '--delay', '0'])
+        self.assertEqual(rc, 0)
+        ids = {c['identity'] for c in self._read_json('out/a.com-creds.json')}
+        self.assertIn('admin', ids)      # from the IntelX fake
+        self.assertIn('localuser', ids)  # from the local source
+
     def test_target_file_input(self):
         with open('targets.txt', 'w', encoding='utf-8') as f:
             f.write('# clients\na.com\nb.com\n')
@@ -199,6 +209,83 @@ class BatchRunIntegrationTests(unittest.TestCase):
         rc = main.main(['-t', 'a.com,b.com', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)  # a.com succeeded
         self.assertTrue(os.path.exists('out/a.com-creds.json'))
+
+
+class IterLocalDocumentsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        import logging
+        self.log = logging.getLogger('t-local')
+        self.log.addHandler(logging.NullHandler())
+
+    def test_reads_text_skips_binary(self):
+        d = self.tmp.name
+        with open(os.path.join(d, 'a.txt'), 'w') as f:
+            f.write('hello')
+        with open(os.path.join(d, 'b.zip'), 'w') as f:
+            f.write('binary-ish')
+        names = [n for n, _c, _d in main.iter_local_documents(d, self.log)]
+        self.assertTrue(any(n.endswith('a.txt') for n in names))
+        self.assertFalse(any('b.zip' in n for n in names))
+
+    def test_single_file(self):
+        p = os.path.join(self.tmp.name, 'f.txt')
+        with open(p, 'w') as f:
+            f.write('content')
+        docs = list(main.iter_local_documents(p, self.log))
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0][1], 'content')
+        self.assertTrue(docs[0][0].startswith('local:'))
+
+
+class LocalSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self._cwd = os.getcwd()
+        os.chdir(self.work.name)
+        self.addCleanup(lambda: os.chdir(self._cwd))
+        self._env = os.environ.get('INTELX_API_KEY')
+        os.environ.pop('INTELX_API_KEY', None)
+        self._xdg = os.environ.get('XDG_CONFIG_HOME')
+        os.environ['XDG_CONFIG_HOME'] = os.path.join(self.work.name, 'cfg')
+
+        def restore():
+            if self._env is not None:
+                os.environ['INTELX_API_KEY'] = self._env
+            if self._xdg is None:
+                os.environ.pop('XDG_CONFIG_HOME', None)
+            else:
+                os.environ['XDG_CONFIG_HOME'] = self._xdg
+        self.addCleanup(restore)
+
+        os.makedirs('dumps')
+        with open('dumps/combo.txt', 'w', encoding='utf-8') as f:
+            f.write('admin@corp.com:Sup3rSecret1\nx@other.com:nope\n')
+        with open('dumps/leak.csv', 'w', encoding='utf-8') as f:
+            f.write('email,password\ncarol@corp.com,CsvPass99\n')
+
+    def _read(self, path):
+        import json
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+
+    def test_local_only_offline_no_key(self):
+        rc = main.main(['-t', 'corp.com', '--local', 'dumps', '-f', 'json', '--delay', '0'])
+        self.assertEqual(rc, 0)
+        creds = self._read('out/corp.com-creds.json')
+        self.assertEqual({c['identity'] for c in creds}, {'admin@corp.com', 'carol@corp.com'})
+        self.assertTrue(all(c['source'].startswith('local:') for c in creds))
+        self.assertTrue(all(c['target'] == 'corp.com' for c in creds))
+
+    def test_no_source_errors(self):
+        rc = main.main(['-t', 'corp.com', '--delay', '0'])
+        self.assertEqual(rc, 1)
+
+    def test_missing_local_path_errors(self):
+        rc = main.main(['-t', 'corp.com', '--local', 'does-not-exist', '--delay', '0'])
+        self.assertEqual(rc, 2)
 
 
 class StartupBannerTests(unittest.TestCase):

@@ -186,6 +186,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help='Print the buckets your API key can access, then exit.',
     )
     parser.add_argument(
+        '--local', type=str, default=None, metavar='PATH',
+        help='Also search a local file or directory of breach/combolist dumps '
+             '(recursive). Works with no IntelX key for an offline-only run.',
+    )
+    parser.add_argument(
         '--expand-archives', action='store_true',
         help='Walk multi-file leaks (archives/folders) via the treeview and fetch '
              'each child file, so credentials inside bundles are not missed. '
@@ -1594,6 +1599,94 @@ def process_leaks(
     return new_creds, stats
 
 
+# ── Sources / providers ──────────────────────────────────────────────────────
+# A "provider" yields (name, content, date) documents; everything downstream
+# (extract -> match -> score -> dedup -> output) already works on text, so new
+# sources plug in without touching that pipeline. IntelX is the search provider
+# (run_search + concurrent FILE_VIEW, above); below are local files (and, later,
+# GitHub code search).
+_LOCAL_MAX_FILE_BYTES: int = 100 * 1024 * 1024  # read whole file into memory; skip bigger
+_LOCAL_SKIP_EXTS: frozenset = frozenset({
+    '.zip', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar', '.tar', '.png', '.jpg', '.jpeg',
+    '.gif', '.bmp', '.webp', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.iso', '.img', '.mp3', '.mp4', '.avi',
+    '.mov', '.mkv', '.sqlite', '.db', '.parquet',
+})
+
+
+def iter_local_documents(path: str, log: logging.Logger) -> Iterator[Tuple[str, str, str]]:
+    """Yield ``(name, content, date)`` for each readable text file at ``path`` (a
+    file or a directory, walked recursively). Binary extensions and over-large
+    files are skipped so a local breach-dump folder streams through the same
+    extraction pipeline as IntelX results."""
+    if os.path.isfile(path):
+        files = [path]
+    elif os.path.isdir(path):
+        files = [
+            os.path.join(root, name)
+            for root, _dirs, names in os.walk(path)
+            for name in sorted(names)
+        ]
+    else:
+        log.error(f"--local path not found: {path}")
+        return
+
+    for file_path in files:
+        if os.path.splitext(file_path)[1].lower() in _LOCAL_SKIP_EXTS:
+            log.debug(f"Skipping binary file: {file_path}")
+            continue
+        try:
+            if os.path.getsize(file_path) > _LOCAL_MAX_FILE_BYTES:
+                log.warning(
+                    f"Skipping large file (> {_LOCAL_MAX_FILE_BYTES // (1024 * 1024)} MB): {file_path}"
+                )
+                continue
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as handle:
+                content = handle.read()
+            date = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime('%Y-%m-%d')
+        except OSError as e:
+            log.warning(f"Could not read {file_path}: {e}")
+            continue
+        except (ValueError, OverflowError):
+            date = ''
+        yield (f"local:{file_path}", content, date)
+
+
+def process_documents(
+    documents: Iterable[Tuple[str, str, str]],
+    *,
+    mode: str,
+    target_context: Any,
+    person_context: Any,
+    person_name_context: Any,
+    seen: Set[str],
+    log: logging.Logger,
+    scorer: Optional[ConfidenceModel] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Run the extraction pipeline over already-fetched ``(name, content, date)``
+    documents (local/GitHub providers). Shares ``seen`` with other providers so
+    credentials dedup across sources."""
+    new_creds: List[Dict[str, Any]] = []
+    stats = _new_stats()
+    for name, content, date in documents:
+        leak = {'name': name, 'date': date}
+        try:
+            _process_contents(
+                content, leak, mode=mode, target_context=target_context,
+                person_context=person_context, person_name_context=person_name_context,
+                seen=seen, new_creds=new_creds, stats=stats, log=log, scorer=scorer,
+            )
+        except Exception as e:  # untrusted content: never let one document abort the run
+            log.error(f"Unexpected error processing {name}: {type(e).__name__}: {e}")
+    return new_creds, stats
+
+
+def _merge_stats(dst: Dict[str, int], src: Dict[str, int]) -> Dict[str, int]:
+    for key, value in src.items():
+        dst[key] = dst.get(key, 0) + value
+    return dst
+
+
 # ── Output writing ───────────────────────────────────────────────────────────
 def _priv_opener(path: str, flags: int) -> int:
     """opener= for open(): create credential files with 0o600 (owner-only)."""
@@ -2073,112 +2166,134 @@ def run_for_target(
         build_person_name_context(target, domain=args.domain) if target_is_person_name else None
     )
 
-    if warn_flags:
-        if args.person_name and not target_is_email:
-            log.warning("--person-name only enriches an email target; ignoring it here")
-        if args.domain and not target_is_person_name:
-            log.warning("--domain only applies to a person-name target; ignoring it here")
-        if args.email and not target_is_email:
-            log.warning("--email only applies to an email target; ignoring it here")
-        if args.usernames and not target_is_email:
-            log.warning("--usernames only applies to an email target; ignoring it here")
-        if args.company_wide and target_is_email:
-            log.warning("--company-wide only applies to a domain target; ignoring it here")
+    all_creds: List[Dict[str, Any]] = []
+    stats = _new_stats()
+    searched = False  # did at least one provider run successfully?
+    intelx_all_failed = False
 
-    if target_is_person_name:
-        search_terms = build_name_search_terms(target, domain=args.domain)
-    else:
-        search_terms = build_search_terms(
-            target,
-            include_email_pattern=args.email,
-            person_name=args.person_name,
-            company_wide=args.company_wide,
-            include_usernames=args.usernames,
-        )
-    if not search_terms:
-        log.error(f"Could not build any search terms for target '{target}'")
-        return TargetRun(1, 0, [], False)
+    # ── IntelX provider (skipped when no key / ix is None) ──
+    if ix is not None:
+        if warn_flags:
+            if args.person_name and not target_is_email:
+                log.warning("--person-name only enriches an email target; ignoring it here")
+            if args.domain and not target_is_person_name:
+                log.warning("--domain only applies to a person-name target; ignoring it here")
+            if args.email and not target_is_email:
+                log.warning("--email only applies to an email target; ignoring it here")
+            if args.usernames and not target_is_email:
+                log.warning("--usernames only applies to an email target; ignoring it here")
+            if args.company_wide and target_is_email:
+                log.warning("--company-wide only applies to a domain target; ignoring it here")
 
-    if target_is_person_name:
-        if args.domain:
-            log.info(f"Person-name mode: {len(search_terms)} term(s) for '{target}', anchored to domain '{args.domain}'.")
+        if target_is_person_name:
+            search_terms = build_name_search_terms(target, domain=args.domain)
         else:
-            log.warning(
-                f"Person-name mode without --domain: searching '{target}' broadly. "
-                "Results will be noisy; pass --domain corp.com to anchor matches."
+            search_terms = build_search_terms(
+                target,
+                include_email_pattern=args.email,
+                person_name=args.person_name,
+                company_wide=args.company_wide,
+                include_usernames=args.usernames,
             )
-    elif target_is_email:
-        log.info(f"Person-email mode enabled. Generated {len(search_terms)} search terms for '{target}'.")
-        if args.usernames:
-            log.info("Username search enabled: also sweeping username/local-part variants")
-    else:
-        log.info(f"Domain mode: searching selector(s) {search_terms}")
-        if args.company_wide:
-            log.info("Company-wide search enabled: also sweeping the bare domain")
 
-    try:
-        results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
-    except AllSearchesFailed as e:
-        log.error(str(e))
-        return TargetRun(2, 0, [], False)
-    except EXPECTED_LEAK_ERRORS as e:
-        log.error(f"Error searching IntelX API for '{target}': {e}")
-        return TargetRun(1, 0, [], False)
+        if not search_terms:
+            log.error(f"Could not build any search terms for target '{target}'")
+        else:
+            if target_is_person_name:
+                if args.domain:
+                    log.info(f"Person-name mode: {len(search_terms)} term(s) for '{target}', anchored to domain '{args.domain}'.")
+                else:
+                    log.warning(
+                        f"Person-name mode without --domain: searching '{target}' broadly. "
+                        "Results will be noisy; pass --domain corp.com to anchor matches."
+                    )
+            elif target_is_email:
+                log.info(f"Person-email mode enabled. Generated {len(search_terms)} search terms for '{target}'.")
+                if args.usernames:
+                    log.info("Username search enabled: also sweeping username/local-part variants")
+            else:
+                log.info(f"Domain mode: searching selector(s) {search_terms}")
+                if args.company_wide:
+                    log.info("Company-wide search enabled: also sweeping the bare domain")
 
-    discovered: List[str] = []
-    if args.phonebook:
-        try:
-            discovered_seen: Set[str] = set()
-            for term in search_terms:
-                for value in run_phonebook_search(
-                    ix, term, buckets, date_from, date_to, args.maxresults, log, poll_delay=args.delay,
-                ):
-                    if value.lower() not in discovered_seen:
-                        discovered_seen.add(value.lower())
-                        discovered.append(value)
-            emails_path = os.path.join('out', f"{sanitize_filename(target, fallback='target')}-emails.txt")
-            write_phonebook_output(discovered, emails_path, log)
-        except EXPECTED_LEAK_ERRORS as e:
-            log.error(f"Phonebook discovery failed: {e}")
-
-    if args.phonebook_search:
-        pb_domain = resolve_phonebook_domain(target, args.domain, is_person_name=target_is_person_name)
-        if pb_domain:
+            results: Optional[List[Dict[str, Any]]] = None
             try:
-                extra = gather_phonebook_results(
-                    ix, discovered, pb_domain, buckets, date_from, date_to,
-                    args.maxresults, args.phonebook_max, log,
-                )
-                before = len(results)
-                _merge_results(results, extra)
-                log.info(f"Phonebook-search added {len(results) - before} new leak(s) to process")
+                results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
+            except AllSearchesFailed as e:
+                log.error(str(e))
+                intelx_all_failed = True
             except EXPECTED_LEAK_ERRORS as e:
-                log.warning(f"Phonebook-search failed ({e}); keeping primary results")
-        else:
-            log.warning(
-                "--phonebook-search needs a domain anchor (email/domain target, or "
-                "--domain for a person); skipping the discovered-email hunt"
-            )
+                log.error(f"Error searching IntelX API for '{target}': {e}")
 
-    if args.expand_archives:
-        try:
-            results = expand_container_leaks(ix, results, log)
-        except EXPECTED_LEAK_ERRORS as e:
-            log.error(f"Archive expansion failed ({e}); continuing with unexpanded results")
+            if results is not None:
+                discovered: List[str] = []
+                if args.phonebook:
+                    try:
+                        discovered_seen: Set[str] = set()
+                        for term in search_terms:
+                            for value in run_phonebook_search(
+                                ix, term, buckets, date_from, date_to, args.maxresults, log, poll_delay=args.delay,
+                            ):
+                                if value.lower() not in discovered_seen:
+                                    discovered_seen.add(value.lower())
+                                    discovered.append(value)
+                        emails_path = os.path.join('out', f"{sanitize_filename(target, fallback='target')}-emails.txt")
+                        write_phonebook_output(discovered, emails_path, log)
+                    except EXPECTED_LEAK_ERRORS as e:
+                        log.error(f"Phonebook discovery failed: {e}")
 
-    new_creds, stats = process_leaks(
-        ix,
-        results,
-        mode=args.mode,
-        target_context=target_context,
-        person_context=person_context,
-        person_name_context=person_name_context,
-        seen=seen,
-        log=log,
-        workers=args.workers,
-        delay=args.delay,
-        scorer=scorer,
-    )
+                if args.phonebook_search:
+                    pb_domain = resolve_phonebook_domain(target, args.domain, is_person_name=target_is_person_name)
+                    if pb_domain:
+                        try:
+                            extra = gather_phonebook_results(
+                                ix, discovered, pb_domain, buckets, date_from, date_to,
+                                args.maxresults, args.phonebook_max, log,
+                            )
+                            before = len(results)
+                            _merge_results(results, extra)
+                            log.info(f"Phonebook-search added {len(results) - before} new leak(s) to process")
+                        except EXPECTED_LEAK_ERRORS as e:
+                            log.warning(f"Phonebook-search failed ({e}); keeping primary results")
+                    else:
+                        log.warning(
+                            "--phonebook-search needs a domain anchor (email/domain target, or "
+                            "--domain for a person); skipping the discovered-email hunt"
+                        )
+
+                if args.expand_archives:
+                    try:
+                        results = expand_container_leaks(ix, results, log)
+                    except EXPECTED_LEAK_ERRORS as e:
+                        log.error(f"Archive expansion failed ({e}); continuing with unexpanded results")
+
+                creds, intelx_stats = process_leaks(
+                    ix, results, mode=args.mode, target_context=target_context,
+                    person_context=person_context, person_name_context=person_name_context,
+                    seen=seen, log=log, workers=args.workers, delay=args.delay, scorer=scorer,
+                )
+                all_creds.extend(creds)
+                _merge_stats(stats, intelx_stats)
+                searched = True
+
+    # ── Local provider ──
+    if args.local:
+        log.info(f"Searching local source: {colorize(args.local, 'cyan')}")
+        creds, local_stats = process_documents(
+            iter_local_documents(args.local, log),
+            mode=args.mode, target_context=target_context, person_context=person_context,
+            person_name_context=person_name_context, seen=seen, log=log, scorer=scorer,
+        )
+        all_creds.extend(creds)
+        _merge_stats(stats, local_stats)
+        searched = True
+
+    if not searched:
+        # No provider produced results (e.g. all IntelX searches failed and no
+        # other source). Preserve the 2-vs-1 exit-code distinction.
+        return TargetRun(2 if intelx_all_failed else 1, 0, [], False)
+
+    new_creds = all_creds
     for cred in new_creds:
         cred['target'] = target
 
@@ -2226,17 +2341,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return handle_config(args, log)
 
     api_key = resolve_api_key(args, log)
-    if not api_key:
+    use_intelx = bool(api_key)
+    use_local = bool(args.local)
+    if not (use_intelx or use_local):
         log.error(
-            "API key is required. Save one with 'credx config set-key', pass -k, "
-            "or set INTELX_API_KEY in your environment."
+            "No source selected. Provide an IntelX API key ('credx config set-key', -k, "
+            "or INTELX_API_KEY), or use --local for an offline run."
         )
         return 1
-
-    intelx_client = load_intelx_client()
-    if intelx_client is None:
-        log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
-        return 1
+    if use_local and not os.path.exists(args.local):
+        log.error(f"--local path not found: {args.local}")
+        return 2
 
     targets = collect_targets(args.target)
     if not targets:
@@ -2260,31 +2375,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             log.debug(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
 
-    try:
-        ix = intelx_client(api_key)
-        # The SDK sleeps API_RATE_LIMIT seconds inside every call (1s by default),
-        # which serializes FILE_VIEW badly. credx does its own pacing (RateLimiter +
-        # --delay/--workers) and retry/backoff, so disable the SDK's blanket sleep.
-        if hasattr(ix, 'API_RATE_LIMIT'):
-            ix.API_RATE_LIMIT = 0
-        caps = fetch_capabilities(ix, log)  # one call, reused for buckets + usage
-        if args.list_buckets:
-            available = list_available_buckets(caps)
-            print("Buckets your API key can access:")
-            for bucket in available:
-                print(f"  {bucket}")
-            return 0
-        buckets = resolve_search_buckets(args, ix, log, caps)
-    except EXPECTED_LEAK_ERRORS as e:
-        log.error(f"Error initializing IntelX API: {e}")
-        return 1
+    # IntelX provider setup (skipped entirely for an offline --local-only run).
+    ix: Any = None
+    buckets: Tuple[str, ...] = ()
+    caps: Any = None
+    if use_intelx:
+        intelx_client = load_intelx_client()
+        if intelx_client is None:
+            log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
+            return 1
+        try:
+            ix = intelx_client(api_key)
+            # The SDK sleeps API_RATE_LIMIT seconds inside every call (1s by default),
+            # which serializes FILE_VIEW badly. credx does its own pacing (RateLimiter +
+            # --delay/--workers) and retry/backoff, so disable the SDK's blanket sleep.
+            if hasattr(ix, 'API_RATE_LIMIT'):
+                ix.API_RATE_LIMIT = 0
+            caps = fetch_capabilities(ix, log)  # one call, reused for buckets + usage
+            if args.list_buckets:
+                print("Buckets your API key can access:")
+                for bucket in list_available_buckets(caps):
+                    print(f"  {bucket}")
+                return 0
+            buckets = resolve_search_buckets(args, ix, log, caps)
+        except EXPECTED_LEAK_ERRORS as e:
+            log.error(f"Error initializing IntelX API: {e}")
+            return 1
+    elif args.list_buckets:
+        log.error("--list-buckets requires an IntelX API key")
+        return 2
 
+    sources = (['IntelX'] if use_intelx else []) + ([f"local:{args.local}"] if use_local else [])
     key_label = (
         'command-line (-k)' if args.apikey
         else 'environment (INTELX_API_KEY)' if os.getenv('INTELX_API_KEY')
         else f"saved '{args.key_name or keystore.load_config().get('active') or 'default'}'"
+    ) if use_intelx else '— (local only)'
+    print_startup_banner(
+        args, targets, key_label, buckets, date_from, date_to, caps, scorer=scorer, sources=sources,
     )
-    print_startup_banner(args, targets, key_label, buckets, date_from, date_to, caps, scorer=scorer)
 
     os.makedirs('out', exist_ok=True)
 
@@ -2420,6 +2549,7 @@ def print_startup_banner(
     date_to: str,
     caps: Any = None,
     scorer: Any = None,
+    sources: Optional[List[str]] = None,
 ) -> None:
     """Print a config banner (and the key's API credit usage) to stderr at launch."""
     bucket_list = list(buckets)
@@ -2454,9 +2584,13 @@ def print_startup_banner(
         colorize(' developed by AndreaF17 · https://github.com/AndreaF17/credx', 'dim'),
         bar,
         row('Target', target_cell),
+        row('Sources', ', '.join(sources) if sources else 'IntelX'),
         row('Range', f"last {args.range} months  ({date_from[:10]} → {date_to[:10]})"),
-        row('Buckets', f"{len(bucket_list)}"
-            + (f"  ({', '.join(bucket_list[:4])}{'…' if len(bucket_list) > 4 else ''})" if bucket_list else '')),
+    ]
+    if bucket_list:
+        lines.append(row('Buckets', f"{len(bucket_list)}"
+                         f"  ({', '.join(bucket_list[:4])}{'…' if len(bucket_list) > 4 else ''})"))
+    lines += [
         row('Extraction', f"{args.mode}  ·  scoring: {scoring}  ·  matching: {matching}"),
         row('Output', f"{args.format}  →  out/"),
         row('Concurrency', f"{args.workers} worker(s), {args.delay}s delay, max {args.maxresults}/term"),
