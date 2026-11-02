@@ -12,6 +12,7 @@ import tempfile
 import unittest
 
 import main
+import custom.credential_extractor as ce
 from custom.credential_extractor import (
     build_target_context,
     classify_secret,
@@ -518,6 +519,50 @@ class PhonebookSearchArgTests(unittest.TestCase):
     def test_negative_phonebook_max_rejected(self):
         with self.assertRaises(SystemExit):
             main.parse_args(['-t', 'corp.com', '--phonebook-max', '-1'])
+
+
+class ContentRobustnessTests(unittest.TestCase):
+    """Attacker-controlled leak content must never abort the run."""
+
+    def setUp(self):
+        self.log = logging.getLogger('test')
+        self.log.addHandler(logging.NullHandler())
+
+    def test_json_recursion_error_is_caught(self):
+        # On Python <3.15, json.loads raises RecursionError on deeply-nested input;
+        # RecursionError is not a ValueError/TypeError, so it must be caught here.
+        orig = ce.json.loads
+
+        def boom(*a, **k):
+            raise RecursionError('maximum recursion depth exceeded')
+
+        ce.json.loads = boom
+        try:
+            # A line starting with '{' routes through the JSON parser; must not raise.
+            result = extract_credentials_from_line('{"email":"a@b.com","password":"Secret1!"}', mode='balanced')
+        finally:
+            ce.json.loads = orig
+        self.assertIsInstance(result, list)
+
+    def test_unexpected_error_in_one_leak_does_not_abort_run(self):
+        class BoomScorer:
+            def score(self, *a, **k):
+                raise RuntimeError('boom')  # not in EXPECTED_LEAK_ERRORS
+
+        ix = _FakeIX({'s1': 'example.com:admin:StrongPass1'})
+        new_creds, _ = main.process_leaks(
+            ix,
+            [_make_leak('s1')],
+            mode='balanced',
+            target_context=build_target_context('example.com'),
+            person_context=None,
+            seen=set(),
+            log=self.log,
+            workers=1,
+            delay=0,
+            scorer=BoomScorer(),
+        )
+        self.assertEqual(new_creds, [])  # leak skipped, run completed without raising
 
 
 if __name__ == '__main__':

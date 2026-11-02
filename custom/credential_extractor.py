@@ -894,7 +894,10 @@ def _extract_from_json_object(line, candidates, seen, mode):
         return False
     try:
         data = json.loads(stripped)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: deeply-nested JSON in attacker-controlled leak content
+        # (CPython's json raises it on Python <3.15); it is not a ValueError, so
+        # it must be caught explicitly or it would abort the whole run.
         return False
     objects = data if isinstance(data, list) else [data]
     saw_object = False

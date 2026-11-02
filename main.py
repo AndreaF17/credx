@@ -1210,6 +1210,16 @@ def process_leaks(
             except EXPECTED_LEAK_ERRORS as e:
                 log.error(f"Error processing leak {leak.get('name', 'unknown')}: {e}")
                 accepted = 0
+            except Exception as e:
+                # Leak contents are untrusted and malformed in endless ways; one bad
+                # leak must never abort a long, rate-limited run. Log loudly (so a
+                # genuine bug is still visible) and skip just this leak. BaseException
+                # (KeyboardInterrupt/SystemExit) deliberately still propagates.
+                log.error(
+                    f"Unexpected error processing leak {leak.get('name', 'unknown')}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                accepted = 0
         progress.update(accepted)
 
     try:
@@ -1221,7 +1231,8 @@ def process_leaks(
                 futures = [executor.submit(handle, i, leak) for i, leak in enumerate(results)]
                 try:
                     for future in as_completed(futures):
-                        # Surface genuinely unexpected errors instead of swallowing them.
+                        # handle() catches per-leak errors itself; this only re-raises
+                        # a BaseException such as KeyboardInterrupt from a worker.
                         future.result()
                 except KeyboardInterrupt:
                     for f in futures:
