@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "credx"
+version = "0.1.0"
+description = "OSINT tool for searching leaked credentials via the Intelligence X API."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "AndreaF17" }]
+keywords = ["osint", "intelx", "credentials", "security", "breach"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "intelx>=0.6.2",
+    "colorlog",
+    "python-dateutil>=2.8",
+    "python-dotenv",
+]
+
+[project.urls]
+Homepage = "https://github.com/AndreaF17/IntelX-Credential-Scanner"
+Repository = "https://github.com/AndreaF17/IntelX-Credential-Scanner"
+
+[project.scripts]
+credx = "main:main"
+credx-train = "train_confidence_model:main"
+
+[tool.setuptools]
+py-modules = ["main", "train_confidence_model"]
+
+[tool.setuptools.packages.find]
+include = ["custom*"]

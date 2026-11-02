@@ -1,4 +1,4 @@
-# IntelX Credential Scanner
+# credx
 
 A fast OSINT tool for searching leaked credentials using the Intelligence X API. Searches across multiple breach databases and exports results in TXT, JSON, or CSV formats with built-in deduplication and resume capability.
 
@@ -23,24 +23,37 @@ A fast OSINT tool for searching leaked credentials using the Intelligence X API.
 
 ## Installation
 
+Install with [pipx](https://pipx.pypa.io/) to get the `credx` command on your PATH
+in an isolated environment:
+
 ```bash
-# Clone the repository
-git clone https://github.com/AndreaF17/intelx-credential-scanner.git
-cd intelx-credential-scanner
+# From a local checkout
+pipx install .
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Or directly from GitHub
+pipx install git+https://github.com/AndreaF17/IntelX-Credential-Scanner.git
+```
 
-# Install dependencies
-pip install -r requirements.txt
+This installs two commands: `credx` (the scanner) and `credx-train` (the optional
+confidence-model trainer).
+
+### From source (for development)
+
+```bash
+git clone https://github.com/AndreaF17/IntelX-Credential-Scanner.git
+cd IntelX-Credential-Scanner
+
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+pip install -e .
 ```
 
 ## Configuration
 
 ### API Key Setup
 
-Create a `.env` file in the project root:
+Create a `.env` file in the directory you run `credx` from:
 
 ```bash
 INTELX_API_KEY=your_api_key_here
@@ -56,63 +69,63 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 
 ```bash
 # Search for domain credentials (creates domain.com-creds.txt)
-./main.py -t domain.com
+credx -t domain.com
 
 # Search with email pattern enabled
-./main.py -t domain.com -e
+credx -t domain.com -e
 
 # Search for a specific person email target
-./main.py -t john.doe@example.com
+credx -t john.doe@example.com
 
 # Specify output format
-./main.py -t domain.com -f csv
-./main.py -t domain.com -f json
+credx -t domain.com -f csv
+credx -t domain.com -f json
 ```
 
 ### Advanced Options
 
 ```bash
 # Custom date range (12 months) and max results
-./main.py -t domain.com -r 12 -m 500
+credx -t domain.com -r 12 -m 500
 
 # More recall on noisy dumps
-./main.py -t domain.com --mode aggressive
+credx -t domain.com --mode aggressive
 
 # Higher precision mode
-./main.py -t domain.com --mode strict
+credx -t domain.com --mode strict
 
 # Enrich person-email searches with full name terms
-./main.py -t john.doe@example.com --person-name "John Doe"
+credx -t john.doe@example.com --person-name "John Doe"
 
 # Also sweep the bare company name (not just @domain) for host-form creds
-./main.py -t domain.com --company-wide
+credx -t domain.com --company-wide
 
 # Fetch files inside multi-file leaks (archives/stealer-log folders)
-./main.py -t domain.com --expand-archives
+credx -t domain.com --expand-archives
 
 # Enumerate leaked emails/selectors via Phonebook (-> out/domain.com-emails.txt)
-./main.py -t domain.com --phonebook
+credx -t domain.com --phonebook
 
 # Create an anonymized safe-share file
-./main.py -t domain.com --safe-share
+credx -t domain.com --safe-share
 
 # Custom name/path for safe-share file
-./main.py -t domain.com --safe-output client-report.csv
+credx -t domain.com --safe-output client-report.csv
 
 # Enable debug logging
-./main.py -t domain.com -d
+credx -t domain.com -d
 
 # Custom output file
-./main.py -t domain.com -o results.txt
+credx -t domain.com -o results.txt
 
 # Provide API key via CLI
-./main.py -t domain.com -k YOUR_API_KEY
+credx -t domain.com -k YOUR_API_KEY
 ```
 
 ### Full Command Reference
 
 ```
-usage: main.py [-h] -t TARGET [-m MAXRESULTS] [-k APIKEY] [-o OUTPUT]
+usage: credx [-h] -t TARGET [-m MAXRESULTS] [-k APIKEY] [-o OUTPUT]
                [-f {txt,json,csv}] [-r RANGE] [-d] [-e]
                [--person-name PERSON_NAME]
                [--safe-share] [--safe-output SAFE_OUTPUT]
@@ -170,11 +183,11 @@ Train a model:
 
 ```bash
 # Self-contained: train on synthetic labeled data (good for a quick start/demo)
-python train_confidence_model.py --synthetic 600
+credx-train --synthetic 600
 
 # Or weak-supervise from real dump files (labels bootstrapped from high-confidence
 # heuristic hits; trivial/ambiguous candidates handled automatically)
-python train_confidence_model.py --input dumps/*.txt --synthetic 200
+credx-train --input dumps/*.txt --synthetic 200
 ```
 
 This writes `models/confidence_model.json` and prints held-out
@@ -182,10 +195,10 @@ accuracy/precision/recall/F1. Then score with it:
 
 ```bash
 # Bare flag uses models/confidence_model.json
-./main.py -t domain.com --model
+credx -t domain.com --model
 
 # Or point at a specific model file
-./main.py -t domain.com --model path/to/model.json
+credx -t domain.com --model path/to/model.json
 ```
 
 When `--model` is active, the `--mode` threshold is interpreted as a
@@ -248,10 +261,10 @@ If the script is interrupted, simply re-run the same command. It will:
 
 ```bash
 # First run (interrupted)
-./main.py -t domain.com
+credx -t domain.com
 
 # Resume (continues where it left off)
-./main.py -t domain.com
+credx -t domain.com
 ```
 
 ## Logging

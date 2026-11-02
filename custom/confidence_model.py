@@ -23,11 +23,10 @@ from custom.confidence_features import FEATURE_NAMES, candidate_to_vector
 
 MODEL_VERSION = 1
 # Default location the scanner looks for a trained model when asked to use one.
-DEFAULT_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'models',
-    'confidence_model.json',
-)
+# Resolved relative to the current working directory so it matches where
+# ``credx-train`` writes by default (``models/confidence_model.json``) and works
+# the same whether credx is run from the repo or installed via pipx.
+DEFAULT_MODEL_PATH = os.path.join('models', 'confidence_model.json')
 
 
 def _sigmoid(z: float) -> float:
