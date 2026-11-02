@@ -199,7 +199,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         '--phonebook', action='store_true',
         help='Also run an IntelX Phonebook search to enumerate leaked selectors '
-             '(emails/domains) for the target, written to out/<target>-emails.txt.',
+             "(emails/domains) for the target, written to the target's output dir as emails.txt.",
     )
     parser.add_argument(
         '--phonebook-search', action='store_true',
@@ -242,7 +242,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         '--safe-output',
         type=str,
         default=None,
-        help='Optional safe-share output filename (default: out/<output>-safe.csv)',
+        help='Optional safe-share output path (default: a creds-safe.csv sibling of the main output)',
     )
     parser.add_argument(
         '--mode',
@@ -588,17 +588,47 @@ def sanitize_filename(value: str, fallback: str = 'output') -> str:
     return name or fallback
 
 
-def resolve_output_path(args: argparse.Namespace) -> str:
-    """Compute the main output file path inside the ``out/`` directory."""
-    if not args.output:
-        target = sanitize_filename(args.target, fallback='target')
-        return os.path.join('out', f"{target}-creds.{args.format}")
-    return os.path.join('out', sanitize_filename(args.output))
+def output_root() -> str:
+    """Base directory for auto-named output when -o is not given: ``~/.credx/results``
+    (or ``$CREDX_HOME/results``)."""
+    base = os.environ.get('CREDX_HOME') or os.path.join(os.path.expanduser('~'), '.credx')
+    return os.path.join(base, 'results')
+
+
+def target_output_dir(target: str) -> str:
+    """Per-target results directory: ``<root>/<sanitized-target>/`` (target is
+    sanitized so a crafted ``-t`` can never escape the results tree)."""
+    return os.path.join(output_root(), sanitize_filename(target, fallback='target'))
 
 
 def per_target_output_path(target: str, output_format: str) -> str:
-    """Per-target output path inside ``out/`` (used for batch/multi-target runs)."""
-    return os.path.join('out', f"{sanitize_filename(target, fallback='target')}-creds.{output_format}")
+    """Per-target credentials file: ``<root>/<target>/creds.<ext>``."""
+    return os.path.join(target_output_dir(target), f"creds.{output_format}")
+
+
+def _user_output_path(output_arg: str) -> str:
+    """Resolve an explicit -o / --safe-output value to an absolute path (honoring ~).
+
+    Unlike target-derived names, -o is user-supplied (trusted) so it may point
+    anywhere the user chooses.
+    """
+    return os.path.abspath(os.path.expanduser(output_arg))
+
+
+def resolve_output_path(args: argparse.Namespace) -> str:
+    """Single-target main output: the explicit -o path, else the structured default
+    ``~/.credx/results/<target>/creds.<ext>``."""
+    if args.output:
+        return _user_output_path(args.output)
+    return per_target_output_path(args.target, args.format)
+
+
+def combined_output_path(args: argparse.Namespace) -> str:
+    """Combined (multi-target) output file: the explicit -o, else
+    ``~/.credx/results/_batch/creds.<ext>``."""
+    if args.output:
+        return _user_output_path(args.output)
+    return os.path.join(output_root(), '_batch', f"creds.{args.format}")
 
 
 def collect_targets(value: Optional[str]) -> List[str]:
@@ -647,14 +677,12 @@ def compute_date_range(range_months: int, now: Optional[datetime] = None) -> Tup
 
 # ── Safe-share output ────────────────────────────────────────────────────────
 def resolve_safe_output_path(main_output_path: str, safe_output_arg: Optional[str]) -> str:
-    """Resolve the destination path for the safe-share CSV output."""
+    """Safe-share CSV path: the explicit --safe-output, else a sibling of the main
+    output file (``…/creds-safe.csv``)."""
     if safe_output_arg:
-        if os.path.isabs(safe_output_arg) or safe_output_arg.startswith('out/'):
-            return safe_output_arg
-        return f"out/{safe_output_arg}"
-
-    base_name = os.path.splitext(os.path.basename(main_output_path))[0]
-    return os.path.join('out', f"{base_name}-safe.csv")
+        return _user_output_path(safe_output_arg)
+    base = os.path.splitext(main_output_path)[0]
+    return f"{base}-safe.csv"
 
 
 def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -> Iterator[Dict[str, str]]:
@@ -1693,18 +1721,40 @@ def _priv_opener(path: str, flags: int) -> int:
     return os.open(path, flags, 0o600)
 
 
+def _secure_makedirs(directory: str) -> None:
+    """Create ``directory`` and any missing ancestors, setting the dirs this call
+    *creates* to 0o700 so credential output (and the per-target folder names, which
+    reveal engagement scope) is not left world-traversable.
+
+    ``os.makedirs(mode=…)`` only applies the mode to the leaf, so ancestors would be
+    0o755; this chmods each newly-created component. Pre-existing directories (a
+    user-chosen ``-o`` location, ``/tmp`` …) are left untouched.
+    """
+    missing = []
+    probe = os.path.abspath(directory)
+    while probe and not os.path.isdir(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    os.makedirs(directory, exist_ok=True)
+    for created in missing:
+        try:
+            os.chmod(created, 0o700)
+        except OSError:
+            pass
+
+
 def _secure_open(path: str, mode: str, **kwargs: Any):
     """open() for credential files: owner-only perms, UTF-8 text, hardened dir.
 
-    Leaked credentials are sensitive; files are created 0o600 inside an 0o700
-    ``out/`` directory, and a pre-existing file is tightened to 0o600 on append.
+    Leaked credentials are sensitive; files are created 0o600 and the directories
+    credx creates for them are 0o700. A pre-existing file is tightened to 0o600 on
+    append.
     """
     directory = os.path.dirname(path) or '.'
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
+    _secure_makedirs(directory)
     pre_exists = os.path.exists(path)
     if 'b' not in mode:
         kwargs.setdefault('encoding', 'utf-8')
@@ -1754,7 +1804,7 @@ def _load_json_entries(output_file: str, log: logging.Logger) -> List[Dict[str, 
 def _atomic_write_json(output_file: str, entries: List[Dict[str, Any]]) -> None:
     """Write ``entries`` to a temp file in the same directory, then atomically rename."""
     directory = os.path.dirname(output_file) or '.'
-    os.makedirs(directory, exist_ok=True)
+    _secure_makedirs(directory)
     tmp_path = f"{output_file}.tmp.{os.getpid()}"
     try:
         with _secure_open(tmp_path, 'w') as f:
@@ -2237,7 +2287,7 @@ def run_for_target(
                                 if value.lower() not in discovered_seen:
                                     discovered_seen.add(value.lower())
                                     discovered.append(value)
-                        emails_path = os.path.join('out', f"{sanitize_filename(target, fallback='target')}-emails.txt")
+                        emails_path = os.path.join(os.path.dirname(output_file) or '.', 'emails.txt')
                         write_phonebook_output(discovered, emails_path, log)
                     except EXPECTED_LEAK_ERRORS as e:
                         log.error(f"Phonebook discovery failed: {e}")
@@ -2415,9 +2465,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args, targets, key_label, buckets, date_from, date_to, caps, scorer=scorer, sources=sources,
     )
 
-    os.makedirs('out', exist_ok=True)
-
-    # Single target: identical behavior to a classic run (respects -o).
+    # Single target: respects -o; otherwise writes to ~/.credx/results/<target>/.
     if len(targets) == 1:
         target = targets[0]
         args.target = target  # so resolve_output_path / naming use the resolved target
@@ -2460,10 +2508,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     combined_written = 0
     if write_combined:
-        combined_path = (
-            os.path.join('out', sanitize_filename(args.output)) if args.output
-            else os.path.join('out', f"batch-creds.{args.format}")
-        )
+        combined_path = combined_output_path(args)
         comb_seen = load_existing_dedup(combined_path, args.format, log)
         combined_new: List[Dict[str, Any]] = []
         for cred in all_new:
@@ -2580,7 +2625,7 @@ def print_startup_banner(
         '',
         bar,
         colorize(f' credx {_credx_version()} ', 'bold', 'magenta')
-        + colorize(' · IntelX credential scanner', 'dim'),
+        + colorize(' · OSINT credential scanner', 'dim'),
         colorize(' developed by AndreaF17 · https://github.com/AndreaF17/credx', 'dim'),
         bar,
         row('Target', target_cell),
@@ -2592,7 +2637,8 @@ def print_startup_banner(
                          f"  ({', '.join(bucket_list[:4])}{'…' if len(bucket_list) > 4 else ''})"))
     lines += [
         row('Extraction', f"{args.mode}  ·  scoring: {scoring}  ·  matching: {matching}"),
-        row('Output', f"{args.format}  →  out/"),
+        row('Output', f"{args.format}  →  "
+            + colorize(_user_output_path(args.output) if args.output else output_root(), 'cyan')),
         row('Concurrency', f"{args.workers} worker(s), {args.delay}s delay, max {args.maxresults}/term"),
         row('API key', key_label),
     ]

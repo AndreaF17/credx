@@ -1,6 +1,6 @@
 # credx
 
-A fast OSINT tool for finding leaked credentials through the [Intelligence X](https://intelx.io/) API during penetration tests. Target a **domain**, an **email**, or a **person by name**; credx searches multiple breach databases, extracts credentials from the matched dumps, filters out false positives, and exports deduplicated results as TXT, JSON, CSV, or an interactive **HTML report** — with resume support so interrupted runs pick up where they left off.
+A fast OSINT tool for finding leaked credentials during penetration tests, across [Intelligence X](https://intelx.io/), local breach dumps, and other pluggable sources. Target a **domain**, an **email**, or a **person by name** (or many at once); credx searches the configured sources, extracts credentials from the matched dumps, filters out false positives, and exports deduplicated results as TXT, JSON, CSV, or an interactive **HTML report** — with resume support so interrupted runs pick up where they left off.
 
 > ⚠️ **For authorized security assessments only.** See [Disclaimer](#disclaimer).
 
@@ -37,7 +37,7 @@ echo "INTELX_API_KEY=your_key_here" > .env
 credx -t example.com
 ```
 
-That writes deduplicated credentials to `out/example.com-creds.txt` and prints a color-coded run summary. (All output goes into the `out/` directory.)
+That writes deduplicated credentials to `~/.credx/results/example.com/creds.txt` and prints a color-coded run summary. (Auto-named output goes under `~/.credx/results/<target>/`; override the base with `$CREDX_HOME` or point anywhere with `-o`.)
 
 ---
 
@@ -134,14 +134,14 @@ A target with a space (e.g. `"John Doe"`), or any non-email target combined with
 
 > By default credx searches the last **24 months** — most breach data is older, so widen with `-r` (e.g. `-r 60`) for historical coverage, or narrow it for recency.
 
-**Multiple targets.** `-t` also accepts a comma-separated list (`-t "corp.com,acme.com"`) or a file (`-t targets.txt`, one target per line, `#` comments allowed). Each target can be a domain, email, or person name — credx detects the mode per target. With more than one target it writes a per-target file **and** a combined `out/batch-creds.<ext>` (a `target` field/column marks which target each credential matched); choose the layout with `--output-mode per-target|combined|both`.
+**Multiple targets.** `-t` also accepts a comma-separated list (`-t "corp.com,acme.com"`) or a file (`-t targets.txt`, one target per line, `#` comments allowed). Each target can be a domain, email, or person name — credx detects the mode per target. With more than one target it writes a per-target file **and** a combined `~/.credx/results/_batch/creds.<ext>` (a `target` field/column marks which target each credential matched); choose the layout with `--output-mode per-target|combined|both`.
 
 ---
 
 ## Usage
 
 ```bash
-# Basic domain scan  ->  out/example.com-creds.txt
+# Basic domain scan  ->  ~/.credx/results/example.com/creds.txt
 credx -t example.com
 
 # Scan a specific person's email (auto-enables person-email mode)
@@ -187,7 +187,7 @@ credx -t example.com -m 2000
 
 # Scan several targets at once: a comma-list or a file (one target per line)
 credx -t "corp.com,acme.com,john.doe@corp.com"
-credx -t targets.txt                       # out/<target>-creds.* per target + out/batch-creds.*
+credx -t targets.txt                       # ~/.credx/results/<target>/ per target + .../_batch/
 credx -t targets.txt --output-mode combined  # only the combined file (with a 'target' column)
 
 # Share results with a client, anonymized
@@ -210,7 +210,7 @@ credx -t example.com --workers 4 --delay 0.5
 | `-m`, `--maxresults` | `N` | `500` | Max results to return |
 | `-k`, `--apikey` | `KEY` | from env/saved | IntelX API key (overrides env var and saved key) |
 | `--key-name` | `NAME` | active key | Use a saved key by name for this run (see `credx config`) |
-| `-o`, `--output` | `FILE` | `<target>-creds.<ext>` | Output file |
+| `-o`, `--output` | `FILE` | `~/.credx/results/<target>/creds.<ext>` | Output file/path (any location; `~` expanded). Default is a structured tree under `~/.credx/results` (or `$CREDX_HOME`) |
 | `-f`, `--format` | `txt\|json\|csv\|html` | `txt` | Output format |
 | `-r`, `--range` | `MONTHS` | `24` | How far back to search |
 | `-d`, `--debug` | | off | Verbose DEBUG logging |
@@ -224,12 +224,12 @@ credx -t example.com --workers 4 --delay 0.5
 | `--list-buckets` | | off | Print the buckets your key can access, then exit |
 | `--local` | `PATH` | | Also search a local file/dir of breach dumps (recursive); works with no IntelX key |
 | `--expand-archives` | | off | Walk multi-file leaks (archives/folders) and fetch each child file |
-| `--phonebook` | | off | Enumerate leaked selectors to `out/<target>-emails.txt` |
+| `--phonebook` | | off | Enumerate leaked selectors to `<output-dir>/emails.txt` |
 | `--phonebook-search` | | off | Hunt credentials for each discovered email on the target domain (implies `--phonebook`). Big recall boost, many extra API calls |
 | `--phonebook-max` | `N` | `0` | Cap how many discovered emails `--phonebook-search` hunts (`0` = no cap) |
 | `--person-name` | `"Full Name"` | | Enrich person-email search terms |
 | `--safe-share` | | off | Also write a sanitized CSV safe to share externally |
-| `--safe-output` | `FILE` | `out/<output>-safe.csv` | Safe-share output path |
+| `--safe-output` | `FILE` | `<output>-safe.csv` | Safe-share output path (sibling of the main output) |
 | `--mode` | `strict\|balanced\|aggressive` | `balanced` | Extraction precision/recall |
 | `--workers` | `N` | `5` | Concurrent FILE_VIEW workers (raise for speed, lower for strict rate limits) |
 | `--delay` | `SECONDS` | `0.2` | Delay between FILE_VIEW calls (rate limiting) |
@@ -276,6 +276,22 @@ With `--model` active, `--mode` becomes a **probability cutoff** (e.g. `strict` 
 
 ---
 
+## Where results go
+
+With no `-o`, credx writes a structured tree under `~/.credx/results/` (override the base with the `CREDX_HOME` env var):
+
+```
+~/.credx/results/
+  <target>/
+    creds.<ext>        # credentials for that target
+    creds-safe.csv     # --safe-share export (sibling)
+    emails.txt         # --phonebook enumeration
+  _batch/
+    creds.<ext>        # combined file for a multi-target run
+```
+
+Pass `-o <path>` to write to any location you choose (relative or absolute, `~` expanded).
+
 ## Output formats
 
 **TXT** (default) — one credential per line:
@@ -308,7 +324,7 @@ url,identity,email,password,secret_type,date,source,confidence,pattern,...
 https://app.example.com,user@example.com,user@example.com,Password123!,plaintext,2024-05-01,breach_2024_leak.txt,0.97,url_delimited,...
 ```
 
-**HTML** (`-f html`) — a self-contained, interactive report (`out/<target>-creds.html`):
+**HTML** (`-f html`) — a self-contained, interactive report (`~/.credx/results/<target>/creds.html`):
 
 - Searchable, sortable table of every credential, with a **Type** column (plaintext vs. hash)
 - Passwords **masked by default**; click a password or toggle **Reveal passwords** to show them

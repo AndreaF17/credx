@@ -58,16 +58,18 @@ class ArgValidationTests(unittest.TestCase):
 
 
 class PathSanitizationTests(unittest.TestCase):
-    def test_output_cannot_escape_out_dir(self):
-        self.assertEqual(main.resolve_output_path(_args(output='../../etc/evil')), os.path.join('out', 'evil'))
+    def test_default_output_is_structured_under_root(self):
+        path = main.resolve_output_path(_args(target='example.com'))
+        self.assertEqual(path, os.path.join(main.output_root(), 'example.com', 'creds.txt'))
 
     def test_target_path_components_stripped(self):
+        # A crafted target cannot escape the results tree (sanitized to a bare name).
         path = main.resolve_output_path(_args(target='../../../etc/pwn'))
-        self.assertEqual(path, os.path.join('out', 'pwn-creds.txt'))
+        self.assertEqual(path, os.path.join(main.output_root(), 'pwn', 'creds.txt'))
 
-    def test_absolute_output_is_contained(self):
-        path = main.resolve_output_path(_args(output='/etc/passwd'))
-        self.assertEqual(path, os.path.join('out', 'passwd'))
+    def test_explicit_output_is_honored_as_user_path(self):
+        # -o is trusted user input and may point anywhere.
+        self.assertEqual(main.resolve_output_path(_args(output='/tmp/evilx/out.csv')), '/tmp/evilx/out.csv')
 
 
 class OutputFormatMismatchTests(unittest.TestCase):

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "credx"
-version = "0.4.0"
-description = "OSINT tool for searching leaked credentials via the Intelligence X API."
+version = "0.5.0"
+description = "OSINT tool for discovering leaked credentials across Intelligence X, local breach dumps, and other pluggable sources."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

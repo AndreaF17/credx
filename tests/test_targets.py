@@ -99,21 +99,27 @@ class BatchRunIntegrationTests(unittest.TestCase):
         os.environ['INTELX_API_KEY'] = 'TESTKEY'
         self._orig_xdg = os.environ.get('XDG_CONFIG_HOME')
         os.environ['XDG_CONFIG_HOME'] = os.path.join(self.work.name, 'cfg')
+        self._orig_home = os.environ.get('CREDX_HOME')
+        os.environ['CREDX_HOME'] = os.path.join(self.work.name, 'credxhome')
 
         self._orig_loader = main.load_intelx_client
         main.load_intelx_client = lambda: _BatchFakeIX
 
         def restore():
             main.load_intelx_client = self._orig_loader
-            if self._orig_env is None:
-                os.environ.pop('INTELX_API_KEY', None)
-            else:
-                os.environ['INTELX_API_KEY'] = self._orig_env
-            if self._orig_xdg is None:
-                os.environ.pop('XDG_CONFIG_HOME', None)
-            else:
-                os.environ['XDG_CONFIG_HOME'] = self._orig_xdg
+            for var, orig in (('INTELX_API_KEY', self._orig_env), ('XDG_CONFIG_HOME', self._orig_xdg),
+                              ('CREDX_HOME', self._orig_home)):
+                if orig is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = orig
         self.addCleanup(restore)
+
+    def pt(self, target):
+        return os.path.join(main.output_root(), target, 'creds.json')
+
+    def combined(self):
+        return os.path.join(main.output_root(), '_batch', 'creds.json')
 
     def _read_json(self, path):
         import json
@@ -123,34 +129,40 @@ class BatchRunIntegrationTests(unittest.TestCase):
     def test_both_mode_writes_per_target_and_combined(self):
         rc = main.main(['-t', 'a.com,b.com', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)
-        self.assertTrue(os.path.exists('out/a.com-creds.json'))
-        self.assertTrue(os.path.exists('out/b.com-creds.json'))
-        self.assertTrue(os.path.exists('out/batch-creds.json'))
+        self.assertTrue(os.path.exists(self.pt('a.com')))
+        self.assertTrue(os.path.exists(self.pt('b.com')))
+        self.assertTrue(os.path.exists(self.combined()))
 
-        a = self._read_json('out/a.com-creds.json')
+        a = self._read_json(self.pt('a.com'))
         self.assertEqual(a[0]['identity'], 'admin')
         self.assertEqual(a[0]['target'], 'a.com')
 
-        combined = self._read_json('out/batch-creds.json')
+        combined = self._read_json(self.combined())
         self.assertEqual({c['target'] for c in combined}, {'a.com', 'b.com'})
 
     def test_combined_only_mode_skips_per_target_files(self):
         rc = main.main(['-t', 'a.com,b.com', '-f', 'json', '--output-mode', 'combined', '--delay', '0'])
         self.assertEqual(rc, 0)
-        self.assertFalse(os.path.exists('out/a.com-creds.json'))
-        self.assertTrue(os.path.exists('out/batch-creds.json'))
+        self.assertFalse(os.path.exists(self.pt('a.com')))
+        self.assertTrue(os.path.exists(self.combined()))
 
     def test_per_target_only_mode_skips_combined(self):
         rc = main.main(['-t', 'a.com,b.com', '-f', 'json', '--output-mode', 'per-target', '--delay', '0'])
         self.assertEqual(rc, 0)
-        self.assertTrue(os.path.exists('out/a.com-creds.json'))
-        self.assertFalse(os.path.exists('out/batch-creds.json'))
+        self.assertTrue(os.path.exists(self.pt('a.com')))
+        self.assertFalse(os.path.exists(self.combined()))
 
     def test_single_target_unchanged(self):
         rc = main.main(['-t', 'a.com', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)
-        self.assertTrue(os.path.exists('out/a.com-creds.json'))
-        self.assertFalse(os.path.exists('out/batch-creds.json'))  # no combined for single
+        self.assertTrue(os.path.exists(self.pt('a.com')))
+        self.assertFalse(os.path.exists(self.combined()))  # no combined for single
+
+    def test_single_target_respects_explicit_output(self):
+        dest = os.path.join(self.work.name, 'custom', 'myout.json')
+        rc = main.main(['-t', 'a.com', '-o', dest, '-f', 'json', '--delay', '0'])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(dest))
 
     def test_local_merges_with_intelx(self):
         os.makedirs('dumps', exist_ok=True)
@@ -158,7 +170,7 @@ class BatchRunIntegrationTests(unittest.TestCase):
             f.write('a.com:localuser:LocalPass9\n')
         rc = main.main(['-t', 'a.com', '--local', 'dumps', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)
-        ids = {c['identity'] for c in self._read_json('out/a.com-creds.json')}
+        ids = {c['identity'] for c in self._read_json(self.pt('a.com'))}
         self.assertIn('admin', ids)      # from the IntelX fake
         self.assertIn('localuser', ids)  # from the local source
 
@@ -167,7 +179,7 @@ class BatchRunIntegrationTests(unittest.TestCase):
             f.write('# clients\na.com\nb.com\n')
         rc = main.main(['-t', 'targets.txt', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)
-        combined = self._read_json('out/batch-creds.json')
+        combined = self._read_json(self.combined())
         self.assertEqual({c['target'] for c in combined}, {'a.com', 'b.com'})
 
     def test_single_target_write_failure_exits_one(self):
@@ -208,7 +220,7 @@ class BatchRunIntegrationTests(unittest.TestCase):
         main.load_intelx_client = lambda: _PartialIX
         rc = main.main(['-t', 'a.com,b.com', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)  # a.com succeeded
-        self.assertTrue(os.path.exists('out/a.com-creds.json'))
+        self.assertTrue(os.path.exists(self.pt('a.com')))
 
 
 class IterLocalDocumentsTests(unittest.TestCase):
@@ -250,14 +262,16 @@ class LocalSourceTests(unittest.TestCase):
         os.environ.pop('INTELX_API_KEY', None)
         self._xdg = os.environ.get('XDG_CONFIG_HOME')
         os.environ['XDG_CONFIG_HOME'] = os.path.join(self.work.name, 'cfg')
+        self._home = os.environ.get('CREDX_HOME')
+        os.environ['CREDX_HOME'] = os.path.join(self.work.name, 'credxhome')
 
         def restore():
-            if self._env is not None:
-                os.environ['INTELX_API_KEY'] = self._env
-            if self._xdg is None:
-                os.environ.pop('XDG_CONFIG_HOME', None)
-            else:
-                os.environ['XDG_CONFIG_HOME'] = self._xdg
+            for var, orig in (('INTELX_API_KEY', self._env), ('XDG_CONFIG_HOME', self._xdg),
+                              ('CREDX_HOME', self._home)):
+                if orig is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = orig
         self.addCleanup(restore)
 
         os.makedirs('dumps')
@@ -274,10 +288,18 @@ class LocalSourceTests(unittest.TestCase):
     def test_local_only_offline_no_key(self):
         rc = main.main(['-t', 'corp.com', '--local', 'dumps', '-f', 'json', '--delay', '0'])
         self.assertEqual(rc, 0)
-        creds = self._read('out/corp.com-creds.json')
+        creds = self._read(os.path.join(main.output_root(), 'corp.com', 'creds.json'))
         self.assertEqual({c['identity'] for c in creds}, {'admin@corp.com', 'carol@corp.com'})
         self.assertTrue(all(c['source'].startswith('local:') for c in creds))
         self.assertTrue(all(c['target'] == 'corp.com' for c in creds))
+
+    def test_output_dirs_are_private(self):
+        import stat
+        main.main(['-t', 'corp.com', '--local', 'dumps', '-f', 'json', '--delay', '0'])
+        root = main.output_root()
+        for d in (os.path.dirname(root), root, os.path.join(root, 'corp.com')):
+            mode = stat.S_IMODE(os.stat(d).st_mode)
+            self.assertEqual(mode, 0o700, f"{d} is {oct(mode)} (should be 0o700)")
 
     def test_no_source_errors(self):
         rc = main.main(['-t', 'corp.com', '--delay', '0'])
@@ -294,7 +316,7 @@ class StartupBannerTests(unittest.TestCase):
             model=None, include_subdomains=False, company_wide=False, expand_archives=False,
             phonebook=False, phonebook_search=False, usernames=False, safe_share=False,
             output_mode='both', range=24, mode='balanced', format='txt',
-            workers=5, delay=0.2, maxresults=500,
+            workers=5, delay=0.2, maxresults=500, output=None,
         )
         base.update(over)
         import argparse as _argparse

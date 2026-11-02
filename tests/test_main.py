@@ -48,31 +48,62 @@ def _make_leak(storageid, name='leak', date=None):
     return leak
 
 
-class ResolveOutputPathTests(unittest.TestCase):
-    def test_default_path_from_target(self):
-        args = main.parse_args(['-t', 'example.com', '-f', 'json'])
-        self.assertEqual(main.resolve_output_path(args), 'out/example.com-creds.json')
+class OutputRootTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = os.environ.get('CREDX_HOME')
 
-    def test_explicit_output_goes_into_out_dir(self):
+        def restore():
+            if self._orig is None:
+                os.environ.pop('CREDX_HOME', None)
+            else:
+                os.environ['CREDX_HOME'] = self._orig
+        self.addCleanup(restore)
+
+    def test_credx_home_env_overrides_root(self):
+        os.environ['CREDX_HOME'] = '/tmp/mycredx'
+        self.assertEqual(main.output_root(), os.path.join('/tmp/mycredx', 'results'))
+        self.assertEqual(
+            main.per_target_output_path('corp.com', 'json'),
+            os.path.join('/tmp/mycredx', 'results', 'corp.com', 'creds.json'),
+        )
+        self.assertEqual(
+            main.combined_output_path(main.parse_args(['-t', 'x', '-f', 'csv'])),
+            os.path.join('/tmp/mycredx', 'results', '_batch', 'creds.csv'),
+        )
+
+    def test_default_root_is_home_dotdir(self):
+        os.environ.pop('CREDX_HOME', None)
+        self.assertEqual(main.output_root(), os.path.join(os.path.expanduser('~'), '.credx', 'results'))
+
+
+class ResolveOutputPathTests(unittest.TestCase):
+    def test_default_path_is_structured_under_root(self):
+        args = main.parse_args(['-t', 'example.com', '-f', 'json'])
+        self.assertEqual(
+            main.resolve_output_path(args),
+            os.path.join(main.output_root(), 'example.com', 'creds.json'),
+        )
+
+    def test_explicit_output_is_honored(self):
         args = main.parse_args(['-t', 'example.com', '-o', 'creds.txt'])
-        self.assertEqual(main.resolve_output_path(args), 'out/creds.txt')
+        self.assertEqual(main.resolve_output_path(args), os.path.abspath('creds.txt'))
 
 
 class ResolveSafeOutputPathTests(unittest.TestCase):
-    def test_default_derives_from_main_output(self):
+    def test_default_is_sibling_of_main_output(self):
         self.assertEqual(
-            main.resolve_safe_output_path('out/example.com-creds.csv', None),
-            os.path.join('out', 'example.com-creds-safe.csv'),
+            main.resolve_safe_output_path('/home/u/.credx/results/example.com/creds.csv', None),
+            '/home/u/.credx/results/example.com/creds-safe.csv',
         )
 
     def test_absolute_arg_is_kept(self):
-        self.assertEqual(main.resolve_safe_output_path('out/x.csv', '/tmp/share.csv'), '/tmp/share.csv')
+        self.assertEqual(main.resolve_safe_output_path('x.csv', '/tmp/share.csv'), '/tmp/share.csv')
 
-    def test_out_prefixed_arg_is_kept(self):
-        self.assertEqual(main.resolve_safe_output_path('out/x.csv', 'out/share.csv'), 'out/share.csv')
-
-    def test_bare_arg_is_placed_in_out(self):
-        self.assertEqual(main.resolve_safe_output_path('out/x.csv', 'share.csv'), 'out/share.csv')
+    def test_relative_arg_resolved_to_cwd(self):
+        self.assertEqual(
+            main.resolve_safe_output_path('x.csv', 'share.csv'),
+            os.path.abspath('share.csv'),
+        )
 
 
 class ParseArgsTests(unittest.TestCase):
