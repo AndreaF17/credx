@@ -77,15 +77,41 @@ python -m unittest discover -s tests   # run the test suite
 
 ## Configuration
 
-credx needs an Intelligence X API key. Provide it either way:
+credx needs an Intelligence X API key. Provide it any of three ways (highest precedence first):
 
-- **`.env` file** in the directory you run `credx` from:
-  ```bash
-  INTELX_API_KEY=your_key_here
-  ```
-- **CLI flag**: `credx -t example.com -k your_key_here`
+1. **CLI flag**: `credx -t example.com -k your_key_here`
+2. **Environment / `.env` file** in the directory you run `credx` from:
+   ```bash
+   INTELX_API_KEY=your_key_here
+   ```
+3. **Saved key** managed by credx (stored in `~/.config/credx/config.json`, `0600` permissions):
+   ```bash
+   credx config set-key your_key_here
+   ```
 
 Get a key at [intelx.io](https://intelx.io/). Never commit your `.env` file.
+
+### Managing saved keys
+
+credx can store several keys and switch between them — handy when you work across clients or engagements:
+
+```bash
+credx config set-key KEY                 # save as "default" (first key becomes active)
+credx config set-key KEY --name client-a # save another key under a name
+credx config use client-a                # switch the active key
+credx config list                        # list saved keys (masked), * marks the active one
+credx config show --name client-a        # show one key (masked)
+credx config usage                       # show the active key's IntelX credit usage
+credx config clear client-a              # remove one key  (or: --all to remove every key)
+```
+
+Pick a saved key for a single run without switching the active one:
+
+```bash
+credx -t example.com --key-name client-a
+```
+
+Keys are shown masked (`abcd…wxyz`) and never printed in full.
 
 ---
 
@@ -161,7 +187,8 @@ credx -t example.com --workers 4 --delay 0.5
 |---|---|---|---|
 | `-t`, `--target` | `TARGET` | *(required)* | Domain, email, or person name to search |
 | `-m`, `--maxresults` | `N` | `500` | Max results to return |
-| `-k`, `--apikey` | `KEY` | from `.env` | IntelX API key |
+| `-k`, `--apikey` | `KEY` | from env/saved | IntelX API key (overrides env var and saved key) |
+| `--key-name` | `NAME` | active key | Use a saved key by name for this run (see `credx config`) |
 | `-o`, `--output` | `FILE` | `<target>-creds.<ext>` | Output file |
 | `-f`, `--format` | `txt\|json\|csv\|html` | `txt` | Output format |
 | `-r`, `--range` | `MONTHS` | `24` | How far back to search |
@@ -284,7 +311,8 @@ credx -t example.com   # continues where it left off
 - **Multi-bucket search** across `leaks.private`, `leaks.public`, `leaks.private.li`, and `pastes`, paginated automatically up to `-m`
 - **Smart deduplication** across all sources, with resume support
 - **Flexible extraction** — handles `:`, `;`, `|`, and key/value dumps, plus multiple credentials per line
-- **Structured-dump parsing** — reads SQL `INSERT` statements and JSON/NDJSON exports (where the credential columns are named), not just delimited combolists
+- **Structured-dump parsing** — reads SQL `INSERT` statements, JSON/NDJSON exports, and header-named CSV (where the credential columns are named), not just delimited combolists
+- **Multi-key management** — save, name, switch and inspect multiple IntelX keys (`credx config`), with per-key credit-usage reporting
 - **Password-hash detection** — tags each secret as plaintext or a hash type (MD5, SHA-1/256/512, bcrypt, argon2, md5crypt…), so you know what you're cracking
 - **False-positive filtering** with confidence scoring on every match
 - **Optional ML scorer** (stdlib logistic regression) for the cases the heuristic over-trusts
@@ -300,7 +328,7 @@ credx -t example.com   # continues where it left off
 ## Troubleshooting
 
 **`API key is required`**
-Ensure `.env` exists with `INTELX_API_KEY=...` in your current directory, or pass `-k`.
+Save one with `credx config set-key <KEY>`, or ensure `.env` has `INTELX_API_KEY=...` in your current directory, or pass `-k`.
 
 **No credentials found**
 Try `-e` to broaden the search, widen the range with `-r 60`, raise `-m` to page deeper, add `--phonebook-search` to hunt every leaked email on the domain, add `-d` to see what's being searched, or confirm the target exists in IntelX.

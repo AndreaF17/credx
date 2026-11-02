@@ -521,6 +521,137 @@ class PhonebookSearchArgTests(unittest.TestCase):
             main.parse_args(['-t', 'corp.com', '--phonebook-max', '-1'])
 
 
+class HeaderCsvTests(unittest.TestCase):
+    """Header-based CSV: the header names the password column, so extraction is
+    exact (no adjacency guessing)."""
+
+    def test_basic_header_csv(self):
+        content = 'email,password\nalice@corp.com,S3cret!!\nbob@corp.com,Hunter22'
+        cands = ce.extract_credentials_from_csv(content)
+        self.assertIsNotNone(cands)
+        self.assertEqual(
+            {(c['identity'], c['password']) for c in cands},
+            {('alice@corp.com', 'S3cret!!'), ('bob@corp.com', 'Hunter22')},
+        )
+        self.assertTrue(all(c['pattern'] == 'csv_row' for c in cands))
+
+    def test_embedded_comma_in_quoted_password(self):
+        content = 'email,password,note\n"a@corp.com","P@ss,word!","vip"'
+        best = ce.extract_credentials_from_csv(content)[0]
+        self.assertEqual(best['password'], 'P@ss,word!')
+
+    def test_column_order_and_url_mapped_by_header(self):
+        content = 'username,url,password\nbob,https://portal.corp.com,Secret1!'
+        best = ce.extract_credentials_from_csv(content)[0]
+        self.assertEqual(best['identity'], 'bob')
+        self.assertIn('portal.corp.com', best['url'])
+        self.assertEqual(best['password'], 'Secret1!')
+
+    def test_hash_in_password_column_is_tagged(self):
+        content = 'email,password\nx@corp.com,5f4dcc3b5aa765d61d8327deb882cf99'
+        best = ce.extract_credentials_from_csv(content)[0]
+        self.assertEqual(best['secret_type'], 'md5')
+
+    def test_combolist_is_not_csv(self):
+        self.assertIsNone(ce.extract_credentials_from_csv('a@b.com:pass1\nc@d.com:pass2'))
+
+    def test_header_without_password_column_is_not_csv(self):
+        # The old header-less heuristic would have invented 'Alice Smith' as a
+        # password; a header that names no password column yields nothing.
+        self.assertIsNone(
+            ce.extract_credentials_from_csv('email,full_name,role\nalice@corp.com,Alice Smith,Analyst')
+        )
+
+    def test_sql_line_not_misdetected_as_csv(self):
+        sql = "INSERT INTO users (email, password) VALUES ('a@b.com','Secret1!');"
+        self.assertIsNone(ce.extract_credentials_from_csv(sql))
+
+    def test_json_line_not_misdetected_as_csv(self):
+        self.assertIsNone(ce.extract_credentials_from_csv('{"email":"a@b.com","password":"Secret1!"}'))
+
+    def test_quoted_header_row(self):
+        content = '"Email","Password"\nalice@corp.com,S3cret!!'
+        best = ce.extract_credentials_from_csv(content)[0]
+        self.assertEqual(best['identity'], 'alice@corp.com')
+
+    def test_empty_detected_csv_returns_none_for_fallback(self):
+        # Header looks like CSV but the body is colon-delimited: the CSV parse finds
+        # nothing, so it must return None (not []) to let the caller fall back.
+        content = 'email,password\na@corp.com:Secret1\nc@corp.com:Secret2'
+        self.assertIsNone(ce.extract_credentials_from_csv(content))
+
+    def test_username_password_csv_without_url_extracts(self):
+        # A header that names username+password is trustworthy even without a url/email.
+        cands = ce.extract_credentials_from_csv('username,password\nadmin,hunter2pw\nroot,toortoor')
+        self.assertIsNotNone(cands)
+        self.assertEqual(
+            {(c['identity'], c['password']) for c in cands},
+            {('admin', 'hunter2pw'), ('root', 'toortoor')},
+        )
+
+
+class HeaderCsvFallbackTests(unittest.TestCase):
+    """Detecting a CSV header must never suppress the per-line parsers when the CSV
+    parse yields nothing or chokes (review MEDIUM finding)."""
+
+    def setUp(self):
+        self.log = logging.getLogger('test')
+        self.log.addHandler(logging.NullHandler())
+
+    def _run(self, content, target='corp.com'):
+        ix = _FakeIX({'s1': content})
+        return main.process_leaks(
+            ix, [_make_leak('s1')], mode='balanced',
+            target_context=build_target_context(target), person_context=None,
+            seen=set(), log=self.log, workers=1, delay=0,
+        )[0]
+
+    def test_csv_header_colon_body_falls_back_to_line_parsing(self):
+        new = self._run('email,password\na@corp.com:Secret1\nc@corp.com:Secret2')
+        self.assertEqual({c['identity'] for c in new}, {'a@corp.com', 'c@corp.com'})
+
+    def test_csv_header_sql_body_falls_back(self):
+        content = "email,password\nINSERT INTO u (email, password) VALUES ('a@corp.com','Secret1!');"
+        new = self._run(content)
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]['pattern'], 'sql_insert')
+
+    def test_large_field_does_not_drop_later_rows(self):
+        big = 'x' * 200000  # > the 128 KB default csv field limit
+        content = f'email,password,blob\nalice@corp.com,Good1pw,{big}\nbob@corp.com,Good2pw,small'
+        new = self._run(content)
+        self.assertEqual({c['identity'] for c in new}, {'alice@corp.com', 'bob@corp.com'})
+
+
+class HeaderCsvIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.log = logging.getLogger('test')
+        self.log.addHandler(logging.NullHandler())
+
+    def _run(self, content, target='corp.com'):
+        ix = _FakeIX({'s1': content})
+        return main.process_leaks(
+            ix, [_make_leak('s1')], mode='balanced',
+            target_context=build_target_context(target), person_context=None,
+            seen=set(), log=self.log, workers=1, delay=0,
+        )[0]
+
+    def test_process_leaks_parses_header_csv(self):
+        new = self._run('email,password\nalice@corp.com,S3cretPass!')
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]['password'], 'S3cretPass!')
+
+    def test_sql_leak_still_parsed_when_csv_precheck_runs(self):
+        new = self._run("INSERT INTO u (email, password) VALUES ('a@corp.com','Secret1!');")
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]['pattern'], 'sql_insert')
+
+    def test_combolist_leak_still_parsed_when_csv_precheck_runs(self):
+        new = self._run('portal.corp.com:admin:StrongPass1')
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]['identity'], 'admin')
+
+
 class ContentRobustnessTests(unittest.TestCase):
     """Attacker-controlled leak content must never abort the run."""
 

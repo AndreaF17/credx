@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import csv
+import io
 import json
 import re
 import unicodedata
@@ -493,6 +495,7 @@ def calculate_confidence(identity, password, url_part, pattern):
         # Structured dumps are explicitly keyed, so an extracted pair is high-signal.
         'sql_insert': 0.90,
         'json_object': 0.88,
+        'csv_row': 0.86,
         'kv_pairs': 0.78,
         'window_triplet': 0.62,
     }.get(pattern, 0.55)
@@ -565,7 +568,7 @@ def _mode_config(mode):
     return EXTRACTION_MODES.get(mode, EXTRACTION_MODES[DEFAULT_MODE])
 
 
-def _build_candidate(candidates, seen, identity, password, url_part, pattern, raw_line):
+def _build_candidate(candidates, seen, identity, password, url_part, pattern, raw_line, require_anchor=True):
     identity = sanitize_value(identity)
     password = sanitize_value(password)
     url_part = canonicalize_url_part(url_part)
@@ -593,9 +596,12 @@ def _build_candidate(candidates, seen, identity, password, url_part, pattern, ra
 
     # Require a trustworthy anchor: either a real host/URL or an email identity.
     # Without one, a candidate is almost always noise from tabular business data.
+    # ``require_anchor=False`` is used only by the header-based CSV parser, where the
+    # header already names the password column, so a bare username:password row is
+    # a real credential rather than ambiguous tabular data.
     if not _is_plausible_host(url_part):
         url_part = ''
-        if not identity_is_email:
+        if require_anchor and not identity_is_email:
             return
 
     dedup_key = f"{identity.lower()}:{password}"
@@ -750,6 +756,10 @@ _SQL_INSERT_RE = re.compile(
 # Stop after a sane number of value tuples so a pathological single-line dump
 # (one giant multi-row INSERT) can't tie up a worker.
 _SQL_MAX_TUPLES = 5000
+
+# Per-field size cap for CSV parsing (10 MB): large enough for real blob columns,
+# bounded against a pathological single field. Content is already in memory.
+_CSV_FIELD_LIMIT = 10 * 1024 * 1024
 
 
 def _field_tokens(name):
@@ -912,6 +922,101 @@ def _extract_from_json_object(line, candidates, seen, mode):
         if identity and password:
             _build_candidate(candidates, seen, identity, password, url_part, 'json_object', line)
     return saw_object
+
+
+def _looks_like_column_name(cell):
+    """True when ``cell`` is a plausible CSV header label (short, no SQL/JSON
+    punctuation, not a sentence) — so a SQL/JSON line split on commas is not
+    mistaken for a header row."""
+    cell = cell.strip()
+    if not cell or len(cell) > 40:
+        return False
+    if any(ch in cell for ch in '()[]{}"\'=;:@/\\'):
+        return False
+    return len(cell.split()) <= 3
+
+
+def _match_column_index(header, exact_keys, token_keys, skip_tokens):
+    """Return the index of the first header column whose *name* matches ``keys``
+    (exact, then guarded token), or None. Only columns that look like real header
+    labels are considered."""
+    prepared = [
+        (str(name).strip().lower(), _field_tokens(str(name)), idx)
+        for idx, name in enumerate(header)
+        if _looks_like_column_name(str(name))
+    ]
+    for key in exact_keys:
+        for lname, _tokens, idx in prepared:
+            if lname == key:
+                return idx
+    for key in token_keys:
+        for _lname, tokens, idx in prepared:
+            if key in tokens and not (tokens & skip_tokens):
+                return idx
+    return None
+
+
+def extract_credentials_from_csv(contents, mode=DEFAULT_MODE):
+    """Parse a credential CSV whose header names the columns.
+
+    Returns a list of candidate dicts, or ``None`` when the content is not a
+    recognizable credential CSV (no header row naming BOTH an identity and a
+    password column), so the caller can fall back to line-based parsing.
+
+    Reliable because the header names the password column explicitly — unlike a
+    header-less row, where the field beside an email is as likely a name or id as
+    a password. Uses the csv module so quoted fields with embedded commas or
+    newlines are handled correctly.
+    """
+    # Real breach CSVs often carry a large base64/blob/session column; raise the
+    # per-field limit (default 128 KB) so one big field doesn't abort the parse and
+    # silently drop every row after it.
+    try:
+        csv.field_size_limit(_CSV_FIELD_LIMIT)
+    except (OverflowError, ValueError):
+        pass
+
+    reader = csv.reader(io.StringIO(contents))
+    try:
+        header = next(reader)
+    except (StopIteration, csv.Error):
+        return None
+    if len(header) < 2:  # a real CSV header is a row of >= 2 column names
+        return None
+
+    identity_idx = _match_column_index(
+        header, _FIELD_IDENTITY_EXACT, _FIELD_IDENTITY_TOKEN, _IDENTITY_SKIP_TOKENS
+    )
+    password_idx = _match_column_index(
+        header, _FIELD_PASSWORD_EXACT, _FIELD_PASSWORD_TOKEN, _FIELD_SKIP_TOKENS
+    )
+    if identity_idx is None or password_idx is None:
+        return None
+    url_idx = _match_column_index(header, _FIELD_URL_EXACT, _FIELD_URL_TOKEN, _FIELD_SKIP_TOKENS)
+
+    candidates = []
+    seen = set()
+    needed = max(identity_idx, password_idx)
+    try:
+        for row in reader:
+            if len(row) <= needed:
+                continue
+            identity = row[identity_idx].strip()
+            password = row[password_idx].strip()
+            url_part = row[url_idx].strip() if (url_idx is not None and url_idx < len(row)) else ''
+            if identity and password:
+                # The header names the password column, so no URL/email anchor is required.
+                _build_candidate(
+                    candidates, seen, identity, password, url_part, 'csv_row', ','.join(row),
+                    require_anchor=False,
+                )
+    except csv.Error:
+        # A malformed tail (field beyond even the raised limit) ends parsing; keep
+        # what was already extracted rather than discarding the whole file.
+        pass
+    # Return None (not []) when nothing parsed, so the caller falls back to the
+    # per-line parsers — the header alone is not proof the body is really CSV.
+    return candidates or None
 
 
 def _split_chunks(line):

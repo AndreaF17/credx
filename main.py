@@ -43,6 +43,7 @@ from custom.credential_extractor import (
     candidate_mentions_person_email,
     candidate_mentions_person_name,
     candidate_mentions_target,
+    extract_credentials_from_csv,
     extract_credentials_from_line,
     has_dotted_tld,
     is_email_target,
@@ -50,6 +51,7 @@ from custom.credential_extractor import (
 )
 from custom.confidence_model import DEFAULT_MODEL_PATH, ConfidenceModel
 from custom.parser import anonymize_password, parse_line_candidates
+from custom import keystore
 
 # Optional progress bar; the scanner degrades gracefully without it.
 try:  # pragma: no cover - exercised indirectly
@@ -127,9 +129,13 @@ def load_intelx_client() -> Optional[Any]:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments. ``argv`` defaults to ``sys.argv[1:]``."""
     parser = argparse.ArgumentParser(description='Search for leaked credentials')
-    parser.add_argument('-t', '--target', type=str, help='Target to search (domain or email)', required=True)
+    parser.add_argument('-t', '--target', type=str, help='Target to search (domain or email)', required=False)
     parser.add_argument('-m', '--maxresults', type=int, help='Maximum number of results to return', default=DEFAULT_MAX_RESULTS)
     parser.add_argument('-k', '--apikey', type=str, help='IntelX API key', required=False)
+    parser.add_argument(
+        '--key-name', type=str, default=None,
+        help='Use a saved API key by name for this run (manage saved keys with: credx config)',
+    )
     parser.add_argument('-o', '--output', type=str, help='Output file to save the results', default=None)
     parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv', 'html'], help='Output format (txt, json, csv, html)', default='txt')
     parser.add_argument('-r', '--range', type=int, help='Search range in months', default=DEFAULT_RANGE_MONTHS)
@@ -228,7 +234,39 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              'The --mode threshold is then applied as a probability cutoff.',
     )
 
+    # ── `credx config ...` subcommand: manage saved API keys ──────────────────
+    subparsers = parser.add_subparsers(dest='command')
+    config_parser = subparsers.add_parser('config', help='Manage saved IntelX API keys')
+    config_sub = config_parser.add_subparsers(dest='config_action', required=True)
+
+    set_key_p = config_sub.add_parser('set-key', help='Save an API key (the first one becomes active)')
+    set_key_p.add_argument('key', help='The IntelX API key to save')
+    set_key_p.add_argument('--name', default=keystore.DEFAULT_KEY_NAME, help='Name to save it under (default: default)')
+    set_key_p.add_argument('--use', action='store_true', help='Also make this the active key')
+
+    config_sub.add_parser('list', help='List saved keys (masked), marking the active one')
+
+    use_p = config_sub.add_parser('use', help='Switch the active key')
+    use_p.add_argument('name', help='Name of the key to activate')
+
+    show_p = config_sub.add_parser('show', help='Show a saved key (masked)')
+    show_p.add_argument('--name', default=None, help='Key name (default: the active key)')
+
+    clear_p = config_sub.add_parser('clear', help='Remove a saved key')
+    clear_p.add_argument('name', nargs='?', default=None, help='Name of the key to remove')
+    clear_p.add_argument('--all', action='store_true', help='Remove every saved key')
+
+    usage_p = config_sub.add_parser('usage', help="Show the key's IntelX credit usage")
+    usage_p.add_argument('--name', default=None, help='Key name (default: the active key)')
+
     args = parser.parse_args(argv)
+
+    # Config subcommands need neither a target nor scan-arg validation.
+    if args.command == 'config':
+        return args
+
+    if not args.target:
+        parser.error('-t/--target is required (or use a `config` subcommand)')
 
     # --safe-output implies --safe-share.
     if args.safe_output and not args.safe_share:
@@ -312,18 +350,151 @@ def configure_logging(debug: bool) -> logging.Logger:
 
 
 def resolve_api_key(args: argparse.Namespace, log: logging.Logger) -> Optional[str]:
-    """Resolve the IntelX API key from the CLI flag or the environment."""
+    """Resolve the IntelX API key.
+
+    Precedence: ``--apikey`` flag, then ``INTELX_API_KEY`` (env / .env), then a key
+    saved via ``credx config`` — the one named by ``--key-name`` if given, else the
+    active key.
+    """
     if args.apikey:
         log.warning(
             "API key passed via --apikey is visible in your shell history and the process list; "
-            "prefer INTELX_API_KEY in a .env file."
+            "prefer INTELX_API_KEY in a .env file or 'credx config set-key'."
         )
         return args.apikey
+
     load_dotenv()
     api_key = os.getenv('INTELX_API_KEY')
     if api_key:
         log.debug("Using API key from environment variable: [hidden]")
-    return api_key
+        return api_key
+
+    key_name = getattr(args, 'key_name', None)
+    saved = keystore.get_key(key_name)
+    if saved:
+        label = key_name or keystore.load_config().get('active') or 'saved'
+        log.debug(f"Using saved API key '{label}': [hidden]")
+        return saved
+    if key_name:
+        log.error(f"No saved API key named '{key_name}' (see: credx config list)")
+    return None
+
+
+def format_key_usage(caps: Any) -> str:
+    """Render an IntelX GET_CAPABILITIES (/authenticate/info) payload as a readable
+    key-usage summary: per-endpoint remaining/limit credits."""
+    if not isinstance(caps, dict):
+        return "Could not read usage info for this key."
+    lines: List[str] = []
+    account = caps.get('name') or caps.get('id')
+    if account:
+        lines.append(f"Account: {account}")
+
+    rows: List[Tuple[str, Any, Any]] = []
+    paths = caps.get('paths')
+    if isinstance(paths, dict):
+        for endpoint, info in sorted(paths.items()):
+            if not isinstance(info, dict):
+                continue
+            credit = info.get('Credit', info.get('credit'))
+            credit_max = info.get('CreditMax', info.get('creditMax', info.get('creditmax')))
+            if credit is None and credit_max is None:
+                continue
+            rows.append((str(endpoint).strip('/'), credit, credit_max))
+
+    if rows:
+        lines.append("Credits remaining/limit per endpoint:")
+        for label, credit, credit_max in rows:
+            lines.append(f"  {label}: {'?' if credit is None else credit}/"
+                         f"{'?' if credit_max is None else credit_max}")
+    elif not lines:
+        return "No usage/credit info returned for this key."
+    else:
+        lines.append("No per-endpoint credit info returned.")
+    return '\n'.join(lines)
+
+
+def handle_config(args: argparse.Namespace, log: logging.Logger) -> int:
+    """Dispatch a ``credx config ...`` subcommand. Returns a process exit code.
+
+    Data output (list/show/usage) goes to stdout; status and errors go to the log.
+    Full keys are never printed — only masked forms.
+    """
+    action = args.config_action
+
+    if action == 'set-key':
+        keystore.set_key(args.name, args.key, make_active=args.use)
+        active = keystore.load_config().get('active')
+        note = ' (now active)' if active == args.name else ''
+        print(f"Saved key '{args.name}' [{keystore.mask_key(args.key)}]{note}")
+        return 0
+
+    if action == 'list':
+        cfg = keystore.load_config()
+        if not cfg['keys']:
+            print("No API keys saved. Add one with: credx config set-key <KEY> [--name NAME]")
+            return 0
+        print("Saved IntelX API keys:")
+        for name in sorted(cfg['keys']):
+            marker = '*' if name == cfg['active'] else ' '
+            print(f" {marker} {name}: {keystore.mask_key(cfg['keys'][name])}")
+        print("(* = active; used when no -k flag or INTELX_API_KEY is set)")
+        return 0
+
+    if action == 'use':
+        if keystore.use_key(args.name):
+            print(f"Active key is now '{args.name}'")
+            return 0
+        log.error(f"No saved key named '{args.name}' (see: credx config list)")
+        return 1
+
+    if action == 'show':
+        cfg = keystore.load_config()
+        resolved = args.name or cfg.get('active')
+        key = keystore.get_key(args.name)
+        if not key:
+            log.error(f"No saved key named '{args.name}'" if args.name else "No active key saved")
+            return 1
+        print(f"{resolved}: {keystore.mask_key(key)}")
+        return 0
+
+    if action == 'clear':
+        if args.all:
+            keystore.clear_all()
+            print("Removed all saved API keys")
+            return 0
+        if args.name:
+            if keystore.remove_key(args.name):
+                print(f"Removed key '{args.name}'")
+                return 0
+            log.error(f"No saved key named '{args.name}'")
+            return 1
+        log.error("Specify a key name to remove, or --all to remove every key")
+        return 2
+
+    if action == 'usage':
+        key = keystore.get_key(args.name)
+        if not key:
+            log.error(
+                f"No saved key named '{args.name}'" if args.name
+                else "No active key saved (add one with: credx config set-key <KEY>)"
+            )
+            return 1
+        client_factory = load_intelx_client()
+        if client_factory is None:
+            log.error("IntelX SDK not available; cannot query key usage")
+            return 1
+        try:
+            ix = client_factory(key)
+            caps = ix.GET_CAPABILITIES()
+        except Exception as e:  # network/SDK/auth failure — report, don't crash
+            log.error(f"Could not fetch key usage: {type(e).__name__}: {e}")
+            return 1
+        print(format_key_usage(caps))
+        return 0
+
+    log.error(f"Unknown config action: {action!r}")
+    return 2
 
 
 def sanitize_filename(value: str, fallback: str = 'output') -> str:
@@ -1079,6 +1250,64 @@ def _process_contents(
     min_confidence = EXTRACTION_MODES[mode]['min_confidence']
     accepted_total = 0
 
+    def accept(candidate: Dict[str, Any], source_line: str) -> bool:
+        """Score, target-match, dedup and record one candidate. Returns True if kept."""
+        nonlocal accepted_total
+        if scorer is not None:
+            candidate['confidence'] = scorer.score(candidate, source_line)
+        if candidate['confidence'] < min_confidence:
+            stats['low_confidence_skips'] += 1
+            log.debug(f"Skipped (low confidence {candidate['confidence']:.2f}): {candidate['canonical']}")
+            return False
+
+        if person_context:
+            target_match = candidate_mentions_person_email(candidate, source_line, person_context)
+        elif person_name_context:
+            target_match = candidate_mentions_person_name(candidate, source_line, person_name_context)
+        else:
+            target_match = candidate_mentions_target(candidate, source_line, target_context)
+
+        if not target_match:
+            stats['target_skips'] += 1
+            log.debug(f"Skipped (target mismatch): {candidate['canonical']}")
+            return False
+
+        cred_key = candidate['dedup_key']
+        if cred_key in seen:
+            stats['duplicates'] += 1
+            log.debug(f"Duplicate skipped: {candidate['canonical']}")
+            return False
+
+        seen.add(cred_key)
+        identity = candidate['identity']
+        new_creds.append({
+            'url': candidate['url'],
+            'identity': identity,
+            'email': identity if '@' in identity else '',
+            'password': candidate['password'],
+            'secret_type': candidate.get('secret_type', 'plaintext'),
+            'source': leak.get('name', 'unknown'),
+            'date': _leak_date(leak),
+            'raw_line': source_line,
+            'canonical': candidate['canonical'],
+            'confidence': candidate['confidence'],
+            'pattern': candidate['pattern'],
+        })
+        stats['new_credentials'] += 1
+        accepted_total += 1
+        log.info(f"Found ({candidate['pattern']} {candidate['confidence']:.2f}): {candidate['canonical']}")
+        return True
+
+    # Header-based CSV: when the whole content is a credential CSV (a header naming
+    # an identity and a password column), parse it by column and skip the per-line
+    # pass, which would mis-split quoted rows. Returns None for anything else.
+    csv_candidates = extract_credentials_from_csv(contents, mode)
+    if csv_candidates is not None:
+        stats['candidates_extracted'] += len(csv_candidates)
+        for candidate in csv_candidates:
+            accept(candidate, candidate.get('raw_line') or candidate['canonical'])
+        return accepted_total
+
     # Iterate lines lazily (StringIO) rather than materializing a full list from
     # contents.split('\n'); large stealer-log dumps can be tens of MB.
     for line in io.StringIO(contents):
@@ -1095,57 +1324,7 @@ def _process_contents(
             continue
 
         stats['candidates_extracted'] += len(candidates)
-        accepted_for_line = 0
-
-        for candidate in candidates:
-            if scorer is not None:
-                candidate['confidence'] = scorer.score(candidate, line_stripped)
-            if candidate['confidence'] < min_confidence:
-                stats['low_confidence_skips'] += 1
-                log.debug(f"Skipped (low confidence {candidate['confidence']:.2f}): {candidate['canonical']}")
-                continue
-
-            if person_context:
-                target_match = candidate_mentions_person_email(candidate, line_stripped, person_context)
-            elif person_name_context:
-                target_match = candidate_mentions_person_name(candidate, line_stripped, person_name_context)
-            else:
-                target_match = candidate_mentions_target(candidate, line_stripped, target_context)
-
-            if not target_match:
-                stats['target_skips'] += 1
-                log.debug(f"Skipped (target mismatch): {candidate['canonical']}")
-                continue
-
-            cred_key = candidate['dedup_key']
-            if cred_key in seen:
-                stats['duplicates'] += 1
-                log.debug(f"Duplicate skipped: {candidate['canonical']}")
-                continue
-
-            seen.add(cred_key)
-
-            identity = candidate['identity']
-            email_value = identity if '@' in identity else ''
-
-            new_creds.append({
-                'url': candidate['url'],
-                'identity': identity,
-                'email': email_value,
-                'password': candidate['password'],
-                'secret_type': candidate.get('secret_type', 'plaintext'),
-                'source': leak.get('name', 'unknown'),
-                'date': _leak_date(leak),
-                'raw_line': line_stripped,
-                'canonical': candidate['canonical'],
-                'confidence': candidate['confidence'],
-                'pattern': candidate['pattern'],
-            })
-            stats['new_credentials'] += 1
-            accepted_for_line += 1
-            accepted_total += 1
-            log.info(f"Found ({candidate['pattern']} {candidate['confidence']:.2f}): {candidate['canonical']}")
-
+        accepted_for_line = sum(1 for candidate in candidates if accept(candidate, line_stripped))
         if accepted_for_line > 1:
             stats['multi_candidate_lines'] += 1
 
@@ -1685,6 +1864,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point. Returns a process exit code."""
     args = parse_args(argv)
     log = configure_logging(args.debug)
+
+    # `credx config ...` manages saved API keys and exits before any search.
+    if getattr(args, 'command', None) == 'config':
+        return handle_config(args, log)
 
     output_file = resolve_output_path(args)
     if args.output:
