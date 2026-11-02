@@ -264,10 +264,12 @@ class LocalSourceTests(unittest.TestCase):
         os.environ['XDG_CONFIG_HOME'] = os.path.join(self.work.name, 'cfg')
         self._home = os.environ.get('CREDX_HOME')
         os.environ['CREDX_HOME'] = os.path.join(self.work.name, 'credxhome')
+        self._ghtok = os.environ.get('GITHUB_TOKEN')
+        os.environ.pop('GITHUB_TOKEN', None)
 
         def restore():
             for var, orig in (('INTELX_API_KEY', self._env), ('XDG_CONFIG_HOME', self._xdg),
-                              ('CREDX_HOME', self._home)):
+                              ('CREDX_HOME', self._home), ('GITHUB_TOKEN', self._ghtok)):
                 if orig is None:
                     os.environ.pop(var, None)
                 else:
@@ -301,6 +303,11 @@ class LocalSourceTests(unittest.TestCase):
             mode = stat.S_IMODE(os.stat(d).st_mode)
             self.assertEqual(mode, 0o700, f"{d} is {oct(mode)} (should be 0o700)")
 
+    def test_zero_result_still_creates_output_dir(self):
+        rc = main.main(['-t', 'noresults.example', '--local', 'dumps', '-f', 'json', '--delay', '0'])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isdir(os.path.join(main.output_root(), 'noresults.example')))
+
     def test_no_source_errors(self):
         rc = main.main(['-t', 'corp.com', '--delay', '0'])
         self.assertEqual(rc, 1)
@@ -308,6 +315,89 @@ class LocalSourceTests(unittest.TestCase):
     def test_missing_local_path_errors(self):
         rc = main.main(['-t', 'corp.com', '--local', 'does-not-exist', '--delay', '0'])
         self.assertEqual(rc, 2)
+
+    def test_github_token_required(self):
+        rc = main.main(['-t', 'corp.com', '--github', '--delay', '0'])  # no token, no key
+        self.assertEqual(rc, 1)
+
+    def test_github_only_run(self):
+        import base64
+
+        def fake_get(url, token, accept='application/vnd.github+json'):
+            if 'search/code' in url:
+                return {'items': [{'repository': {'full_name': 'o/r'}, 'path': 'a.env',
+                                   'url': 'https://api.github.com/contents/a'}]}
+            return {'encoding': 'base64', 'content': base64.b64encode(b'dev@corp.com:GhSecret1').decode()}
+
+        orig = main._github_get
+        main._github_get = fake_get
+        os.environ['GITHUB_TOKEN'] = 'TOK'
+        try:
+            rc = main.main(['-t', 'corp.com', '--github', '-f', 'json', '--delay', '0'])
+        finally:
+            main._github_get = orig
+        self.assertEqual(rc, 0)
+        creds = self._read(os.path.join(main.output_root(), 'corp.com', 'creds.json'))
+        self.assertTrue(
+            any(c['identity'] == 'dev@corp.com' and c['source'].startswith('github:') for c in creds)
+        )
+
+
+class GithubProviderTests(unittest.TestCase):
+    def setUp(self):
+        import logging
+        self.log = logging.getLogger('t-gh')
+        self.log.addHandler(logging.NullHandler())
+
+    def test_iter_github_documents_decodes_and_names(self):
+        import base64
+
+        def fake_get(url, token, accept='application/vnd.github+json'):
+            if 'search/code' in url:
+                return {'items': [{'repository': {'full_name': 'o/r'}, 'path': 'a.env',
+                                   'url': 'https://api.github.com/contents/a'}]}
+            return {'encoding': 'base64', 'content': base64.b64encode(b'admin@corp.com:Secret1x').decode()}
+
+        orig = main._github_get
+        main._github_get = fake_get
+        try:
+            docs = list(main.iter_github_documents('corp.com', 'TOK', self.log, max_results=10))
+        finally:
+            main._github_get = orig
+        self.assertEqual(len(docs), 1)
+        self.assertTrue(docs[0][0].startswith('github:o/r/a.env'))
+        self.assertIn('admin@corp.com', docs[0][1])
+
+    def test_iter_github_handles_401(self):
+        import urllib.error
+
+        def fake_get(url, token, accept='application/vnd.github+json'):
+            raise urllib.error.HTTPError(url, 401, 'Unauthorized', None, None)
+
+        orig = main._github_get
+        main._github_get = fake_get
+        try:
+            self.assertEqual(list(main.iter_github_documents('corp.com', 'BAD', self.log)), [])
+        finally:
+            main._github_get = orig
+
+    def test_github_get_rejects_offhost_url(self):
+        # The bearer token must never be sent to a non-GitHub host (SSRF guard).
+        with self.assertRaises(ValueError):
+            main._github_get('http://169.254.169.254/latest/meta-data/', 'TOK')
+
+    def test_iter_github_stops_on_rate_limit(self):
+        import urllib.error
+
+        def fake_get(url, token, accept='application/vnd.github+json'):
+            raise urllib.error.HTTPError(url, 403, 'rate limited', None, None)
+
+        orig = main._github_get
+        main._github_get = fake_get
+        try:
+            self.assertEqual(list(main.iter_github_documents('corp.com', 'TOK', self.log)), [])
+        finally:
+            main._github_get = orig
 
 
 class StartupBannerTests(unittest.TestCase):

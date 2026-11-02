@@ -12,6 +12,7 @@ point is ``main()``, guarded by ``if __name__ == '__main__'``.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import getpass
 import html as html_lib
@@ -24,6 +25,9 @@ import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -189,6 +193,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         '--local', type=str, default=None, metavar='PATH',
         help='Also search a local file or directory of breach/combolist dumps '
              '(recursive). Works with no IntelX key for an offline-only run.',
+    )
+    parser.add_argument(
+        '--github', action='store_true',
+        help='Also search PUBLIC GitHub code for the target (leaked configs/.env). '
+             'Needs a token (GitHub Code Search is auth-only) — see --github-token.',
+    )
+    parser.add_argument(
+        '--github-token', type=str, default=None, metavar='TOKEN',
+        help='GitHub token for --github (else $GITHUB_TOKEN). A scopeless classic PAT '
+             'works for public code; add the repo scope (or a fine-grained token) for '
+             'your private repos.',
     )
     parser.add_argument(
         '--expand-archives', action='store_true',
@@ -1680,6 +1695,97 @@ def iter_local_documents(path: str, log: logging.Logger) -> Iterator[Tuple[str, 
         yield (f"local:{file_path}", content, date)
 
 
+_GITHUB_API = 'https://api.github.com'
+_GITHUB_PER_PAGE = 100
+_GITHUB_MAX_PAGES = 10  # GitHub code search returns at most 1000 results (10 x 100)
+_GITHUB_MAX_READ = 8 * 1024 * 1024  # cap a single API response read (contents are ~1 MB)
+
+
+def _github_get(url: str, token: str, accept: str = 'application/vnd.github+json') -> Any:
+    """GET a GitHub API URL with auth, returning parsed JSON. Raises on HTTP error.
+
+    The URL MUST be on api.github.com — the bearer token is attached, so this guards
+    against sending it anywhere else if an API response ever carries an off-host URL.
+    """
+    if not url.startswith(_GITHUB_API + '/'):
+        raise ValueError(f"refusing to send GitHub token to non-GitHub host: {url!r}")
+    request = urllib.request.Request(url, headers={
+        'Authorization': f'Bearer {token}',
+        'Accept': accept,
+        'User-Agent': 'credx',
+        'X-GitHub-Api-Version': '2022-11-28',
+    })
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 (host-allowlisted above)
+        return json.loads(response.read(_GITHUB_MAX_READ).decode('utf-8', 'replace'))
+
+
+def _github_decode_content(meta: Any) -> str:
+    """Decode a GitHub contents-API payload (base64) to text."""
+    if not isinstance(meta, dict):
+        return ''
+    if meta.get('encoding') == 'base64' and isinstance(meta.get('content'), str):
+        try:
+            return base64.b64decode(meta['content']).decode('utf-8', 'replace')
+        except (ValueError, TypeError):
+            return ''
+    content = meta.get('content')
+    return content if isinstance(content, str) else ''
+
+
+def iter_github_documents(
+    target: str, token: str, log: logging.Logger, max_results: int = 100, poll_delay: float = 0.0,
+) -> Iterator[Tuple[str, str, str]]:
+    """Yield ``(name, content, date)`` for public GitHub code files matching ``target``
+    (leaked .env/configs committed to repos). Requires a token — GitHub's Code Search
+    API is authentication-only — and respects its rate limit by stopping on 403/429.
+    """
+    query = urllib.parse.quote(f'"{target}"')
+    fetched = 0
+    for page in range(1, _GITHUB_MAX_PAGES + 1):
+        if fetched >= max_results:
+            return
+        search_url = f"{_GITHUB_API}/search/code?q={query}&per_page={_GITHUB_PER_PAGE}&page={page}"
+        try:
+            data = _github_get(search_url, token)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                log.warning(f"GitHub rate limit reached ({e.code}); stopping GitHub search")
+            elif e.code == 401:
+                log.error("GitHub token rejected (401); check GITHUB_TOKEN / --github-token")
+            elif e.code == 422:
+                log.warning(f"GitHub could not process the query for '{target}' (422)")
+            else:
+                log.warning(f"GitHub search failed (HTTP {e.code})")
+            return
+        except (urllib.error.URLError, ValueError, OSError) as e:
+            log.warning(f"GitHub search error: {e}")
+            return
+
+        items = data.get('items') if isinstance(data, dict) else None
+        if not items:
+            return
+        for item in items:
+            if fetched >= max_results:
+                return
+            repo = (item.get('repository') or {}).get('full_name', '?')
+            path = item.get('path', '?')
+            contents_url = item.get('url')
+            if not contents_url:
+                continue
+            try:
+                content = _github_decode_content(_github_get(contents_url, token))
+            except (urllib.error.HTTPError, urllib.error.URLError, ValueError, OSError) as e:
+                log.debug(f"GitHub content fetch failed for {repo}/{path}: {e}")
+                continue
+            if content:
+                fetched += 1
+                yield (f"github:{repo}/{path}", content, '')
+            if poll_delay:
+                time.sleep(poll_delay)
+        if len(items) < _GITHUB_PER_PAGE:
+            return
+
+
 def process_documents(
     documents: Iterable[Tuple[str, str, str]],
     *,
@@ -2221,6 +2327,14 @@ def run_for_target(
     searched = False  # did at least one provider run successfully?
     intelx_all_failed = False
 
+    # Create the output directory up front so it exists even when a run finds nothing
+    # (otherwise the folder shown in the banner would never appear on a zero-result run).
+    if write_file:
+        try:
+            _secure_makedirs(os.path.dirname(output_file) or '.')
+        except OSError as e:
+            log.warning(f"Could not create output directory for {output_file}: {e}")
+
     # ── IntelX provider (skipped when no key / ix is None) ──
     if ix is not None:
         if warn_flags:
@@ -2338,6 +2452,18 @@ def run_for_target(
         _merge_stats(stats, local_stats)
         searched = True
 
+    # ── GitHub code-search provider ──
+    if args.github and getattr(args, 'github_token', None):
+        log.info(f"Searching GitHub public code for {colorize(target, 'cyan')}")
+        creds, gh_stats = process_documents(
+            iter_github_documents(target, args.github_token, log, max_results=args.maxresults, poll_delay=args.delay),
+            mode=args.mode, target_context=target_context, person_context=person_context,
+            person_name_context=person_name_context, seen=seen, log=log, scorer=scorer,
+        )
+        all_creds.extend(creds)
+        _merge_stats(stats, gh_stats)
+        searched = True
+
     if not searched:
         # No provider produced results (e.g. all IntelX searches failed and no
         # other source). Preserve the 2-vs-1 exit-code distinction.
@@ -2393,15 +2519,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     api_key = resolve_api_key(args, log)
     use_intelx = bool(api_key)
     use_local = bool(args.local)
-    if not (use_intelx or use_local):
+    use_github = bool(args.github)
+    if not (use_intelx or use_local or use_github):
         log.error(
             "No source selected. Provide an IntelX API key ('credx config set-key', -k, "
-            "or INTELX_API_KEY), or use --local for an offline run."
+            "or INTELX_API_KEY), or use --local / --github."
         )
         return 1
     if use_local and not os.path.exists(args.local):
         log.error(f"--local path not found: {args.local}")
         return 2
+    if use_github:
+        args.github_token = args.github_token or os.getenv('GITHUB_TOKEN')
+        if not args.github_token:
+            log.error(
+                "--github needs a token (GitHub Code Search is auth-only). Set GITHUB_TOKEN "
+                "or pass --github-token; a scopeless classic PAT works for public code."
+            )
+            return 1
 
     targets = collect_targets(args.target)
     if not targets:
@@ -2455,14 +2590,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("--list-buckets requires an IntelX API key")
         return 2
 
-    sources = (['IntelX'] if use_intelx else []) + ([f"local:{args.local}"] if use_local else [])
+    sources = (
+        (['IntelX'] if use_intelx else [])
+        + ([f"local:{args.local}"] if use_local else [])
+        + (['GitHub'] if use_github else [])
+    )
     key_label = (
         'command-line (-k)' if args.apikey
         else 'environment (INTELX_API_KEY)' if os.getenv('INTELX_API_KEY')
         else f"saved '{args.key_name or keystore.load_config().get('active') or 'default'}'"
     ) if use_intelx else '— (local only)'
+    # Show the precise destination: the per-target file for a single target, the
+    # results tree for a batch (or the explicit -o when given).
+    if args.output:
+        output_label = _user_output_path(args.output)
+    elif len(targets) == 1:
+        output_label = per_target_output_path(targets[0], args.format)
+    else:
+        output_label = output_root() + os.sep
     print_startup_banner(
-        args, targets, key_label, buckets, date_from, date_to, caps, scorer=scorer, sources=sources,
+        args, targets, key_label, buckets, date_from, date_to, caps,
+        scorer=scorer, sources=sources, output_label=output_label,
     )
 
     # Single target: respects -o; otherwise writes to ~/.credx/results/<target>/.
@@ -2595,6 +2743,7 @@ def print_startup_banner(
     caps: Any = None,
     scorer: Any = None,
     sources: Optional[List[str]] = None,
+    output_label: Optional[str] = None,
 ) -> None:
     """Print a config banner (and the key's API credit usage) to stderr at launch."""
     bucket_list = list(buckets)
@@ -2638,7 +2787,7 @@ def print_startup_banner(
     lines += [
         row('Extraction', f"{args.mode}  ·  scoring: {scoring}  ·  matching: {matching}"),
         row('Output', f"{args.format}  →  "
-            + colorize(_user_output_path(args.output) if args.output else output_root(), 'cyan')),
+            + colorize(output_label or (_user_output_path(args.output) if args.output else output_root()), 'cyan')),
         row('Concurrency', f"{args.workers} worker(s), {args.delay}s delay, max {args.maxresults}/term"),
         row('API key', key_label),
     ]

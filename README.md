@@ -117,6 +117,24 @@ credx -t example.com --key-name client-a
 
 Keys are shown masked (`abcd…wxyz`) and never printed in full.
 
+### GitHub source (optional)
+
+`--github` searches **public GitHub code** for your target (leaked `.env` files, configs, and other secrets committed to repos) and runs the matches through the same extraction pipeline.
+
+GitHub's Code Search API is **authentication-only**, so a token is required — but it's **free**:
+
+- **Classic PAT** — for **public** code, create one with **no scopes** (it only provides authentication). Add the **`repo`** scope to also search your own **private** repos.
+- **Fine-grained PAT** — grant **"Public repositories (read-only)"** (or specific private repos with **Contents: read**).
+
+Create one at *GitHub → Settings → Developer settings → Personal access tokens*, then:
+
+```bash
+export GITHUB_TOKEN=ghp_your_token      # or pass --github-token ghp_...
+credx -t corp.com --github
+```
+
+Code search is rate-limited (~10 requests/min); credx backs off and stops gracefully when the limit is hit.
+
 ---
 
 ## Targeting: domain, email, person
@@ -182,6 +200,11 @@ credx -t example.com --buckets darknet.tor,pastes   # search exactly these
 credx -t example.com --local ./dumps       # scan a folder of dumps through the same pipeline
 credx -t example.com --local ./dumps -k KEY  # IntelX + local, merged and deduped
 
+# Search public GitHub code for leaked configs/.env (needs a token, see below)
+export GITHUB_TOKEN=ghp_...                 # or pass --github-token
+credx -t example.com --github              # add GitHub to the search
+credx -t example.com --local ./dumps --github   # combine any sources; results merge + dedup
+
 # Search deeper: results are paginated automatically — just raise -m
 credx -t example.com -m 2000
 
@@ -223,6 +246,8 @@ credx -t example.com --workers 4 --delay 0.5
 | `--darknet` | | off | Also search darknet buckets (`darknet.tor`, `darknet.i2p`) |
 | `--list-buckets` | | off | Print the buckets your key can access, then exit |
 | `--local` | `PATH` | | Also search a local file/dir of breach dumps (recursive); works with no IntelX key |
+| `--github` | | off | Also search public GitHub code for the target (needs a token) |
+| `--github-token` | `TOKEN` | `$GITHUB_TOKEN` | GitHub token for `--github` |
 | `--expand-archives` | | off | Walk multi-file leaks (archives/folders) and fetch each child file |
 | `--phonebook` | | off | Enumerate leaked selectors to `<output-dir>/emails.txt` |
 | `--phonebook-search` | | off | Hunt credentials for each discovered email on the target domain (implies `--phonebook`). Big recall boost, many extra API calls |
@@ -358,7 +383,7 @@ credx -t example.com   # continues where it left off
 - **Batch targets** — scan a comma-list or a file of targets in one run, writing per-target files and/or a combined report (`--output-mode`)
 - **Exact-domain matching** — a domain target matches only that domain by default (not its sub-domains); opt into sub-domains with `--include-subdomains`
 - **Fast by default** — concurrent fetching plus one search call across all buckets; a startup banner shows the run config and the key's remaining API credits
-- **Multiple sources** — pluggable providers: IntelX plus local breach/combolist dumps (`--local`, works offline with no key); results from all sources merge and dedup, each tagged with its `source`
+- **Multiple sources** — pluggable providers: IntelX, local breach/combolist dumps (`--local`, works offline with no key), and public GitHub code search (`--github`); results from all sources merge and dedup, each tagged with its `source`
 - **Password-hash detection** — tags each secret as plaintext or a hash type (MD5, SHA-1/256/512, bcrypt, argon2, md5crypt…), so you know what you're cracking
 - **False-positive filtering** with confidence scoring on every match
 - **Optional ML scorer** (stdlib logistic regression) for the cases the heuristic over-trusts
