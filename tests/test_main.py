@@ -271,6 +271,47 @@ class RunSearchTests(unittest.TestCase):
         self.assertEqual(results, [])
 
 
+class BucketSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.log = _silent_logger()
+
+    def _args(self, buckets=None, darknet=False):
+        import argparse
+        return argparse.Namespace(buckets=buckets, darknet=darknet)
+
+    def test_explicit_buckets_override(self):
+        caps = {'buckets': ['leaks.private', 'pastes']}
+        out = main.resolve_search_buckets(self._args(buckets='a, b ,c'), None, self.log, caps)
+        self.assertEqual(out, ('a', 'b', 'c'))
+
+    def test_default_uses_licensed(self):
+        caps = {'buckets': ['leaks.private', 'pastes']}
+        out = main.resolve_search_buckets(self._args(), None, self.log, caps)
+        self.assertEqual(out, ('leaks.private', 'pastes'))
+
+    def test_darknet_appends(self):
+        caps = {'buckets': ['leaks.private', 'darknet.tor', 'darknet.i2p']}
+        out = main.resolve_search_buckets(self._args(darknet=True), None, self.log, caps)
+        for bucket in main.DARKNET_BUCKETS:
+            self.assertIn(bucket, out)
+
+    def test_darknet_dedups(self):
+        out = main.resolve_search_buckets(self._args(buckets='darknet.tor', darknet=True), None, self.log, {})
+        self.assertEqual(out.count('darknet.tor'), 1)
+
+    def test_list_available_from_caps(self):
+        self.assertEqual(main.list_available_buckets({'buckets': ['x', 'y']}), ['x', 'y'])
+
+    def test_list_available_falls_back_to_default(self):
+        self.assertEqual(main.list_available_buckets({}), list(main.BUCKETS))
+
+    def test_bucket_flags_parse(self):
+        args = main.parse_args(['-t', 'corp.com', '--buckets', 'a,b', '--darknet', '--list-buckets'])
+        self.assertEqual(args.buckets, 'a,b')
+        self.assertTrue(args.darknet)
+        self.assertTrue(args.list_buckets)
+
+
 class ResolveBucketsTests(unittest.TestCase):
     def setUp(self):
         self.log = _silent_logger()

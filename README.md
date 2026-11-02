@@ -173,6 +173,11 @@ credx -t example.com --expand-archives    # open multi-file leaks/archives
 credx -t example.com --phonebook          # enumerate leaked emails
 credx -t example.com --phonebook-search   # then hunt creds for each discovered email (big recall boost)
 
+# Dark web & bucket control (IntelX indexes Tor/I2P too)
+credx --list-buckets                       # see which buckets your key can access
+credx -t example.com --darknet             # also search darknet buckets
+credx -t example.com --buckets darknet.tor,pastes   # search exactly these
+
 # Search deeper: results are paginated automatically — just raise -m
 credx -t example.com -m 2000
 
@@ -210,6 +215,9 @@ credx -t example.com --workers 4 --delay 0.5
 | `--usernames` | | off | For an email target, also search username/local-part variants |
 | `--company-wide` | | off | For a domain target, also search the bare domain (catches `domain:user:pass`) |
 | `--include-subdomains` | | off | Match sub-domains of a domain target (`ds.example.com`); default is exact domain only |
+| `--buckets` | `a,b,c` | auto | Search exactly these IntelX buckets, overriding auto-detection |
+| `--darknet` | | off | Also search darknet buckets (`darknet.tor`, `darknet.i2p`) |
+| `--list-buckets` | | off | Print the buckets your key can access, then exit |
 | `--expand-archives` | | off | Walk multi-file leaks (archives/folders) and fetch each child file |
 | `--phonebook` | | off | Enumerate leaked selectors to `out/<target>-emails.txt` |
 | `--phonebook-search` | | off | Hunt credentials for each discovered email on the target domain (implies `--phonebook`). Big recall boost, many extra API calls |

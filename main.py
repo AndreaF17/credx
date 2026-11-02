@@ -67,6 +67,9 @@ _UNSET: Any = object()
 
 # Buckets searched on IntelX, in priority order.
 BUCKETS: Tuple[str, ...] = ('leaks.private', 'leaks.public', 'leaks.private.li', 'pastes')
+# Known IntelX darknet buckets, added by --darknet (the exact set your key exposes
+# is shown by --list-buckets; names vary by plan).
+DARKNET_BUCKETS: Tuple[str, ...] = ('darknet.tor', 'darknet.i2p')
 
 # Maximum retries for FILE_VIEW API calls.
 MAX_RETRIES: int = 3
@@ -167,6 +170,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         '--include-subdomains', action='store_true',
         help='For a domain target, also match sub-domains (ds.example.com). By default '
              'only the exact domain (example.com) is matched.',
+    )
+    parser.add_argument(
+        '--buckets', type=str, default=None,
+        help='Comma-separated IntelX buckets to search, overriding auto-detection '
+             '(e.g. --buckets darknet.tor,pastes). See --list-buckets for names.',
+    )
+    parser.add_argument(
+        '--darknet', action='store_true',
+        help=f'Also search darknet buckets ({", ".join(DARKNET_BUCKETS)}) in addition '
+             'to the resolved set.',
+    )
+    parser.add_argument(
+        '--list-buckets', action='store_true',
+        help='Print the buckets your API key can access, then exit.',
     )
     parser.add_argument(
         '--expand-archives', action='store_true',
@@ -871,6 +888,41 @@ def resolve_buckets(ix: Any, log: logging.Logger, caps: Any = _UNSET) -> Tuple[s
 
     log.debug("Could not determine licensed buckets from capabilities; using default list")
     return BUCKETS
+
+
+def list_available_buckets(caps: Any) -> List[str]:
+    """Return the buckets the key can access (from capabilities), or the default list."""
+    licensed = _extract_buckets_from_capabilities(caps) if caps else []
+    return list(licensed) if licensed else list(BUCKETS)
+
+
+def resolve_search_buckets(
+    args: argparse.Namespace, ix: Any, log: logging.Logger, caps: Any,
+) -> Tuple[str, ...]:
+    """Compute the final bucket set to search, honoring --buckets and --darknet.
+
+    --buckets overrides auto-detection; --darknet appends the known darknet buckets.
+    When capabilities are known, warn (don't block) about buckets that aren't licensed.
+    """
+    if args.buckets:
+        base = [b.strip() for b in args.buckets.split(',') if b.strip()]
+    else:
+        base = list(resolve_buckets(ix, log, caps=caps))
+
+    if args.darknet:
+        for bucket in DARKNET_BUCKETS:
+            if bucket not in base:
+                base.append(bucket)
+
+    licensed = set(_extract_buckets_from_capabilities(caps)) if caps else set()
+    if licensed:
+        unlicensed = [b for b in base if b not in licensed]
+        if unlicensed:
+            log.warning(
+                "Bucket(s) not in your licensed set (may return nothing): "
+                + ', '.join(unlicensed)
+            )
+    return tuple(base)
 
 
 # ── Multi-file archive expansion ─────────────────────────────────────────────
@@ -2218,7 +2270,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if hasattr(ix, 'API_RATE_LIMIT'):
             ix.API_RATE_LIMIT = 0
         caps = fetch_capabilities(ix, log)  # one call, reused for buckets + usage
-        buckets = resolve_buckets(ix, log, caps=caps)
+        if args.list_buckets:
+            available = list_available_buckets(caps)
+            print("Buckets your API key can access:")
+            for bucket in available:
+                print(f"  {bucket}")
+            return 0
+        buckets = resolve_search_buckets(args, ix, log, caps)
     except EXPECTED_LEAK_ERRORS as e:
         log.error(f"Error initializing IntelX API: {e}")
         return 1
